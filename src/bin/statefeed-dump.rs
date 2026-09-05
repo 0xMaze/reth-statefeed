@@ -9,7 +9,10 @@ use clap::Parser;
 use eyre::{Result, ensure};
 use reth_statefeed::{
     client::{FrameReader, PackedValues},
-    wire::{BlockRef, BlockStage, CAP_EXECUTED, PROTOCOL_VERSION, envelope},
+    wire::{
+        BlockRef, BlockStage, CAP_CANDIDATE_RETIREMENT, CAP_EXECUTED, CAP_FORKCHOICE_APPLIED,
+        ForkchoiceView, PROTOCOL_VERSION, RetirementReason, envelope,
+    },
 };
 use tokio::net::UnixStream;
 
@@ -71,6 +74,13 @@ async fn main() -> Result<()> {
                     "genesis hash is not 32 bytes"
                 );
                 capabilities = hello.capabilities;
+                if capabilities & CAP_EXECUTED != 0 {
+                    ensure!(
+                        capabilities & CAP_FORKCHOICE_APPLIED != 0
+                            && capabilities & CAP_CANDIDATE_RETIREMENT != 0,
+                        "peer advertises EXECUTED without complete fork lifecycle semantics"
+                    );
+                }
                 println!(
                     "hello seq={sequence} chain_id={} service={} capabilities=0x{:x}",
                     hello.chain_id, hello.service_version, hello.capabilities
@@ -106,6 +116,13 @@ async fn main() -> Result<()> {
             envelope::Event::Snapshot(snapshot) => {
                 validate_generation(active_generation, generation)?;
                 let block = validate_block_ref(snapshot.block.as_ref())?;
+                let view = validate_forkchoice_view(snapshot.forkchoice.as_ref())?;
+                ensure!(
+                    view.head.as_ref().is_some_and(|head| {
+                        head.number == block.number && head.hash == block.hash
+                    }),
+                    "snapshot forkchoice head does not match its projection"
+                );
                 candidates.clear();
                 candidates.insert(block.hash.clone(), block.parent_hash.clone());
                 let values = PackedValues::new(&snapshot.values, key_count)?;
@@ -190,6 +207,44 @@ async fn main() -> Result<()> {
                     "rejected seq={sequence} generation={generation} hash=0x{} reason={}",
                     alloy_primitives::hex::encode(event.block_hash),
                     event.reason
+                );
+            }
+            envelope::Event::ForkchoiceApplied(event) => {
+                validate_generation(active_generation, generation)?;
+                ensure!(
+                    capabilities & CAP_FORKCHOICE_APPLIED != 0,
+                    "peer emitted ForkchoiceApplied without advertising its capability"
+                );
+                let view = validate_forkchoice_view(event.view.as_ref())?;
+                let head = view.head.as_ref().expect("validated above");
+                println!(
+                    "forkchoice seq={sequence} generation={generation} head={}/0x{} safe={} finalized={}",
+                    head.number,
+                    alloy_primitives::hex::encode(&head.hash),
+                    checkpoint_number(view.safe.as_ref()),
+                    checkpoint_number(view.finalized.as_ref()),
+                );
+            }
+            envelope::Event::CandidatesRetired(event) => {
+                validate_generation(active_generation, generation)?;
+                ensure!(
+                    capabilities & CAP_CANDIDATE_RETIREMENT != 0,
+                    "peer emitted CandidatesRetired without advertising its capability"
+                );
+                let reason = RetirementReason::try_from(event.reason)
+                    .map_err(|_| eyre::eyre!("unknown retirement reason {}", event.reason))?;
+                ensure!(
+                    reason != RetirementReason::Unspecified,
+                    "unspecified retirement reason"
+                );
+                ensure!(!event.block_hashes.is_empty(), "empty retirement batch");
+                for hash in &event.block_hashes {
+                    ensure!(hash.len() == 32, "retired hash is not 32 bytes");
+                    candidates.remove_exact(hash);
+                }
+                println!(
+                    "retired seq={sequence} generation={generation} count={} reason={reason:?}",
+                    event.block_hashes.len(),
                 );
             }
             envelope::Event::Gap(gap) => {
@@ -357,6 +412,44 @@ fn validate_block_ref(block: Option<&BlockRef>) -> Result<&BlockRef> {
     Ok(block)
 }
 
+fn validate_forkchoice_view(view: Option<&ForkchoiceView>) -> Result<&ForkchoiceView> {
+    let view = view.ok_or_else(|| eyre::eyre!("event has no forkchoice view"))?;
+    let head = view
+        .head
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("forkchoice view has no head"))?;
+    ensure!(
+        head.hash.len() == 32,
+        "forkchoice head hash is not 32 bytes"
+    );
+    for checkpoint in [view.safe.as_ref(), view.finalized.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        ensure!(
+            checkpoint.hash.len() == 32,
+            "checkpoint hash is not 32 bytes"
+        );
+        ensure!(
+            checkpoint.number <= head.number,
+            "checkpoint number exceeds forkchoice head"
+        );
+    }
+    if let (Some(safe), Some(finalized)) = (&view.safe, &view.finalized) {
+        ensure!(
+            finalized.number <= safe.number,
+            "finalized checkpoint is ahead of safe checkpoint"
+        );
+    }
+    Ok(view)
+}
+
+fn checkpoint_number(checkpoint: Option<&reth_statefeed::wire::CheckpointRef>) -> String {
+    checkpoint
+        .map(|checkpoint| checkpoint.number.to_string())
+        .unwrap_or_else(|| "unset".into())
+}
+
 fn block_number(block: Option<&reth_statefeed::wire::BlockRef>) -> String {
     block
         .map(|block| block.number.to_string())
@@ -366,6 +459,7 @@ fn block_number(block: Option<&reth_statefeed::wire::BlockRef>) -> String {
 #[derive(Debug)]
 struct CandidateTracker {
     parents: HashMap<Vec<u8>, Vec<u8>>,
+    children: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     insertion_order: VecDeque<Vec<u8>>,
     limit: usize,
 }
@@ -374,30 +468,37 @@ impl CandidateTracker {
     fn new(limit: usize) -> Self {
         Self {
             parents: HashMap::with_capacity(limit.min(4096)),
+            children: HashMap::with_capacity(limit.min(4096)),
             insertion_order: VecDeque::with_capacity(limit.min(4096)),
             limit,
         }
     }
 
     fn insert(&mut self, hash: Vec<u8>, parent_hash: Vec<u8>) {
-        match self.parents.entry(hash) {
+        match self.parents.entry(hash.clone()) {
             Entry::Occupied(mut entry) => {
-                entry.insert(parent_hash);
+                let previous_parent = entry.insert(parent_hash.clone());
+                if previous_parent != parent_hash {
+                    self.remove_child(&previous_parent, &hash);
+                    self.children.entry(parent_hash).or_default().push(hash);
+                }
             }
             Entry::Vacant(entry) => {
-                self.insertion_order.push_back(entry.key().clone());
-                entry.insert(parent_hash);
+                self.insertion_order.push_back(hash.clone());
+                entry.insert(parent_hash.clone());
+                self.children.entry(parent_hash).or_default().push(hash);
             }
         }
         while self.parents.len() > self.limit {
             if let Some(oldest) = self.insertion_order.pop_front() {
-                self.parents.remove(&oldest);
+                self.remove_exact(&oldest);
             }
         }
     }
 
     fn clear(&mut self) {
         self.parents.clear();
+        self.children.clear();
         self.insertion_order.clear();
     }
 
@@ -407,17 +508,30 @@ impl CandidateTracker {
 
     fn remove_tree(&mut self, root: &[u8]) {
         let mut pending = vec![root.to_vec()];
-        while let Some(parent) = pending.pop() {
-            pending.extend(
-                self.parents
-                    .iter()
-                    .filter(|(_, parent_hash)| parent_hash.as_slice() == parent)
-                    .map(|(hash, _)| hash.clone()),
-            );
-            self.parents.remove(&parent);
+        while let Some(hash) = pending.pop() {
+            if let Some(children) = self.children.remove(&hash) {
+                pending.extend(children);
+            }
+            self.remove_exact(&hash);
         }
         self.insertion_order
             .retain(|hash| self.parents.contains_key(hash));
+    }
+
+    fn remove_exact(&mut self, hash: &[u8]) {
+        if let Some(parent) = self.parents.remove(hash) {
+            self.remove_child(&parent, hash);
+        }
+        self.insertion_order.retain(|candidate| candidate != hash);
+    }
+
+    fn remove_child(&mut self, parent: &[u8], child: &[u8]) {
+        if let Some(children) = self.children.get_mut(parent) {
+            children.retain(|candidate| candidate.as_slice() != child);
+            if children.is_empty() {
+                self.children.remove(parent);
+            }
+        }
     }
 }
 
@@ -455,6 +569,20 @@ mod tests {
         assert!(!candidates.contains_key(&[1; 32]));
         assert!(candidates.contains_key(&[2; 32]));
         assert!(candidates.contains_key(&[3; 32]));
+    }
+
+    #[test]
+    fn exact_retirement_keeps_descendants_until_they_are_named() {
+        let parent = vec![1; 32];
+        let child = vec![2; 32];
+        let mut candidates = CandidateTracker::new(8);
+        candidates.insert(parent.clone(), vec![0; 32]);
+        candidates.insert(child.clone(), parent.clone());
+
+        candidates.remove_exact(&parent);
+
+        assert!(!candidates.contains_key(&parent));
+        assert!(candidates.contains_key(&child));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use prost::Message;
 use thiserror::Error;
 
 /// Current statefeed wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Capability bit: full projections are emitted for candidate blocks.
 pub const CAP_FULL_PROJECTIONS: u64 = 1 << 0;
@@ -20,6 +20,10 @@ pub const CAP_CANONICAL: u64 = 1 << 2;
 pub const CAP_REJECTED: u64 = 1 << 3;
 /// Capability bit: pre-validation executed projections are available.
 pub const CAP_EXECUTED: u64 = 1 << 4;
+/// Capability bit: every applied `VALID` forkchoice update is emitted as an ordering fence.
+pub const CAP_FORKCHOICE_APPLIED: u64 = 1 << 5;
+/// Capability bit: bounded candidate retention has explicit retirement events.
+pub const CAP_CANDIDATE_RETIREMENT: u64 = 1 << 6;
 
 /// Common envelope for every server-to-consumer message.
 #[derive(Clone, PartialEq, Message)]
@@ -40,7 +44,10 @@ pub struct Envelope {
     #[prost(uint64, tag = "5")]
     pub emitted_at_monotonic_ns: u64,
     /// Event payload.
-    #[prost(oneof = "envelope::Event", tags = "10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(
+        oneof = "envelope::Event",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+    )]
     pub event: Option<envelope::Event>,
 }
 
@@ -49,8 +56,8 @@ pub mod envelope {
     use prost::Oneof;
 
     use super::{
-        BlockRejected, BlockState, BlockValidated, CanonicalHead, ConfigActivated, Gap, Hello,
-        Snapshot,
+        BlockRejected, BlockState, BlockValidated, CandidatesRetired, CanonicalHead,
+        ConfigActivated, ForkchoiceApplied, Gap, Hello, Snapshot,
     };
 
     /// One concrete statefeed event.
@@ -80,6 +87,12 @@ pub mod envelope {
         /// Stream discontinuity requiring recovery.
         #[prost(message, tag = "17")]
         Gap(Gap),
+        /// A successfully applied `VALID` forkchoice update.
+        #[prost(message, tag = "18")]
+        ForkchoiceApplied(ForkchoiceApplied),
+        /// Candidates no longer retained by this statefeed incarnation.
+        #[prost(message, tag = "19")]
+        CandidatesRetired(CandidatesRetired),
     }
 }
 
@@ -142,6 +155,31 @@ pub struct BlockRef {
     pub timestamp: u64,
 }
 
+/// Minimal numbered checkpoint identity used by forkchoice views.
+#[derive(Clone, PartialEq, Message)]
+pub struct CheckpointRef {
+    /// Block number.
+    #[prost(uint64, tag = "1")]
+    pub number: u64,
+    /// Block hash as exactly 32 bytes.
+    #[prost(bytes = "vec", tag = "2")]
+    pub hash: Vec<u8>,
+}
+
+/// Head, safe, and finalized checkpoints selected by one applied forkchoice update.
+#[derive(Clone, PartialEq, Message)]
+pub struct ForkchoiceView {
+    /// Selected canonical head.
+    #[prost(message, optional, tag = "1")]
+    pub head: Option<CheckpointRef>,
+    /// Selected safe checkpoint, absent when the Engine API hash was zero.
+    #[prost(message, optional, tag = "2")]
+    pub safe: Option<CheckpointRef>,
+    /// Selected finalized checkpoint, absent when the Engine API hash was zero.
+    #[prost(message, optional, tag = "3")]
+    pub finalized: Option<CheckpointRef>,
+}
+
 /// Complete canonical state at an anchored block.
 #[derive(Clone, PartialEq, Message)]
 pub struct Snapshot {
@@ -154,6 +192,9 @@ pub struct Snapshot {
     /// projection into one protobuf field avoids one allocation and one length prefix per key.
     #[prost(bytes = "bytes", tag = "2")]
     pub values: Bytes,
+    /// Applied forkchoice view atomically associated with this canonical snapshot.
+    #[prost(message, optional, tag = "3")]
+    pub forkchoice: Option<ForkchoiceView>,
 }
 
 /// Lifecycle stage attached to a complete block projection.
@@ -219,6 +260,41 @@ pub struct CanonicalHead {
     /// Little-endian bitset of values changed from the previous canonical head.
     #[prost(bytes = "bytes", tag = "5")]
     pub changed_bitmap: Bytes,
+}
+
+/// Ordering fence for every successfully applied `VALID` forkchoice update.
+#[derive(Clone, PartialEq, Message)]
+pub struct ForkchoiceApplied {
+    /// Applied head/safe/finalized view.
+    #[prost(message, optional, tag = "1")]
+    pub view: Option<ForkchoiceView>,
+}
+
+/// Why a candidate is no longer retained by this statefeed incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum RetirementReason {
+    /// Missing or unknown reason. Consumers must reject it.
+    Unspecified = 0,
+    /// The candidate is incompatible with a finalized checkpoint.
+    FinalizedConflict = 1,
+    /// Its full projection was evicted from the bounded local cache.
+    CacheEvicted = 2,
+    /// Its local retention deadline expired.
+    RetentionExpired = 3,
+    /// Reth stopped retaining the candidate in its execution tree.
+    SourcePruned = 4,
+}
+
+/// Exact batch of candidates whose local lifecycle has ended.
+#[derive(Clone, PartialEq, Message)]
+pub struct CandidatesRetired {
+    /// Exact block hashes retired by this event. Descendants are not implicit.
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub block_hashes: Vec<Vec<u8>>,
+    /// Machine-readable [`RetirementReason`].
+    #[prost(enumeration = "RetirementReason", tag = "2")]
+    pub reason: i32,
 }
 
 /// Announces loss of continuity.
@@ -306,5 +382,40 @@ mod tests {
             encode_frame(&envelope, 64),
             Err(EncodeError::FrameTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn protocol_v2_forkchoice_and_retirement_tags_round_trip() {
+        let view = ForkchoiceView {
+            head: Some(CheckpointRef {
+                number: 42,
+                hash: vec![0x42; 32],
+            }),
+            safe: None,
+            finalized: Some(CheckpointRef {
+                number: 40,
+                hash: vec![0x40; 32],
+            }),
+        };
+        for event in [
+            envelope::Event::ForkchoiceApplied(ForkchoiceApplied {
+                view: Some(view.clone()),
+            }),
+            envelope::Event::CandidatesRetired(CandidatesRetired {
+                block_hashes: vec![vec![0xaa; 32], vec![0xbb; 32]],
+                reason: RetirementReason::FinalizedConflict as i32,
+            }),
+        ] {
+            let envelope = Envelope {
+                protocol_version: PROTOCOL_VERSION,
+                boot_id: vec![0; 16].into(),
+                sequence: 7,
+                config_generation: 1,
+                emitted_at_monotonic_ns: 9,
+                event: Some(event),
+            };
+            let frame = encode_frame(&envelope, 4096).unwrap();
+            assert_eq!(Envelope::decode(&frame[4..]).unwrap(), envelope);
+        }
     }
 }

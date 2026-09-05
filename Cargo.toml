@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+alloy-eips = "2.4.1"
 alloy-network = "2.4.1"
 alloy-primitives = { version = "1.7.2", features = ["serde"] }
 arc-swap = "1.8"
@@ -15,17 +16,18 @@ clap = { version = "4", features = ["derive", "env"] }
 core_affinity = "0.8"
 crossbeam-channel = "0.5"
 eyre = "0.6"
+humantime-serde = "1"
 metrics = "0.24"
 notify = "8"
 prost = "0.14"
-reth = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e", default-features = false }
-reth-chain-state = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
-reth-cli-util = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
-reth-db = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e", features = ["mdbx"] }
-reth-engine-tree = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
-reth-node-api = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
-reth-node-ethereum = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
-reth-storage-overlay = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316", default-features = false }
+reth-chain-state = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth-cli-util = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth-db = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316", features = ["mdbx"] }
+reth-engine-tree = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth-node-api = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth-node-ethereum = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth-storage-overlay = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1.15"
 thiserror = "2"

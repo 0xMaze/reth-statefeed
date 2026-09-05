@@ -8,7 +8,7 @@ and consumer recomputation.
 
 - Host: Apple Mac Studio `Mac14,13`, Apple M2 Max, 12 logical CPUs
 - OS: Darwin 24.5.0 arm64
-- Build: Cargo `release` profile, Reth v2.5.2 fork commit `6d512bdb`, Criterion `--quick`
+- Build: Cargo `release` profile, Reth v2.5.2 fork commit `3de74507`, Criterion `--quick`
 - CPU affinity: not set
 - Command: `cargo bench --locked --bench hot_path -- --quick`
 
@@ -23,6 +23,7 @@ and consumer recomputation.
 | 4 changed slots, four of 10,000 watched addresses | 10,000 | 83.47–84.00 ns |
 | all changed | 10,000 | 170.80–176.97 µs |
 | extraction + bounded queue round trip, 4 changed slots | 1,000 | 152.66–153.36 ns |
+| fixed-size applied-FCU enqueue + dequeue | n/a | 103.90–105.47 ns |
 
 The untouched and sparse paths are effectively independent of the total watch count. At both the
 account and storage levels the extractor scans the smaller side and uses an immutable reverse index
@@ -37,3 +38,8 @@ and improving sparse lookup reduced the same-thread extraction/queue/dequeue bas
 it does not include cross-core ownership transfer, publisher park/wakeup, socket delivery, or a
 production metrics recorder. Treat these local ranges as regression signals rather than production
 latency guarantees.
+
+The applied-FCU path copies three numbered hashes and performs the same bounded non-blocking queue
+handoff, but does no watch-set scan, provider read, protobuf encoding, tree walk, or candidate-map
+scan on the Reth engine thread. The local 103.90–105.47 ns result is the same-thread queue round
+trip; cross-core publisher wakeup and UDS delivery remain deployment measurements.

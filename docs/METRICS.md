@@ -18,7 +18,9 @@
 | `statefeed.snapshot.duration_seconds` | histogram | Anchored internal-provider snapshot reads |
 | `statefeed.socket.send.duration_seconds` | histogram | Per-consumer UDS writes, including local backpressure |
 | `statefeed.events.total{type}` | counter | Published live events by lifecycle type |
-| `statefeed.candidates.cached` | gauge | Projected and deferred candidates retained for forks/reorgs |
+| `statefeed.candidates.cached` | gauge | Candidate metadata records retained for forks/reorgs; full projections have a separately configured bound |
+| `statefeed.candidates.projections_cached` | gauge | Full packed candidate projections currently retained |
+| `statefeed.candidates.retired_total` | counter | Exact candidate hashes retired by cache, TTL, finality, or source lifecycle |
 | `statefeed.candidates.parent_cache_misses_total` | counter | Candidates whose parent projection is absent from the bounded cache |
 | `statefeed.consumers.connected` | gauge | Active Unix-socket consumers |
 | `statefeed.consumer.gaps_total` | counter | Consumers disconnected after falling behind the ring |

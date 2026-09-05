@@ -159,6 +159,7 @@ mod tests {
             event: Some(envelope::Event::Snapshot(crate::wire::Snapshot {
                 block: None,
                 values: Bytes::new(),
+                forkchoice: None,
             })),
         };
         let bytes = crate::wire::encode_frame(&envelope, 1024).unwrap();

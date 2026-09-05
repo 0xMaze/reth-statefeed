@@ -31,6 +31,26 @@ pub struct BlockMeta {
     pub timestamp: u64,
 }
 
+/// Numbered consensus checkpoint resolved by Reth while applying forkchoice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointMeta {
+    /// Block number.
+    pub number: u64,
+    /// Block hash.
+    pub hash: B256,
+}
+
+/// Complete forkchoice view associated with one applied `VALID` FCU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkchoiceMeta {
+    /// Selected canonical head.
+    pub head: CheckpointMeta,
+    /// Selected safe checkpoint, absent when the Engine API supplied the zero hash.
+    pub safe: Option<CheckpointMeta>,
+    /// Selected finalized checkpoint, absent when the Engine API supplied the zero hash.
+    pub finalized: Option<CheckpointMeta>,
+}
+
 /// Compact events transferred from the engine thread to the publisher.
 // Keeping the common four-change delta inline avoids a heap allocation on the validator hot path.
 // The bounded queue fixes total memory independently of this enum's stack size.
@@ -78,6 +98,15 @@ pub enum FeedEvent {
         block_number: u64,
         /// Selected head hash.
         block_hash: B256,
+    },
+    /// A `VALID` forkchoice update was accepted and fully applied by Reth.
+    ForkchoiceApplied {
+        /// Time at which the engine completed the forkchoice transition.
+        observed_at: Instant,
+        /// Watch generation active when forkchoice was applied.
+        generation: Generation,
+        /// Resolved head/safe/finalized view.
+        view: ForkchoiceMeta,
     },
     /// Validation rejected a block or payload.
     Rejected {
@@ -229,6 +258,18 @@ impl FeedProducer {
             generation,
             block_number,
             block_hash,
+        });
+    }
+
+    /// Queues an applied forkchoice ordering fence without waiting.
+    #[inline]
+    pub fn publish_forkchoice_applied(&self, view: ForkchoiceMeta) {
+        let observed_at = Instant::now();
+        let generation = self.inner.watch_set.load().generation();
+        self.try_send(FeedEvent::ForkchoiceApplied {
+            observed_at,
+            generation,
+            view,
         });
     }
 
@@ -769,6 +810,44 @@ mod tests {
         assert!(matches!(
             receiver.recv().unwrap(),
             FeedEvent::Validated { block_hash, .. } if block_hash == block.hash
+        ));
+    }
+
+    #[test]
+    fn applied_forkchoice_enqueues_one_fixed_size_view() {
+        let watch_set = Arc::new(WatchSet::compile(
+            7,
+            &[WatchConfig {
+                id: "value".into(),
+                address: Address::ZERO,
+                slot: B256::ZERO,
+            }],
+        ));
+        let (producer, receiver) = FeedProducer::channel(watch_set, 1);
+        let view = ForkchoiceMeta {
+            head: CheckpointMeta {
+                number: 42,
+                hash: B256::with_last_byte(42),
+            },
+            safe: Some(CheckpointMeta {
+                number: 41,
+                hash: B256::with_last_byte(41),
+            }),
+            finalized: Some(CheckpointMeta {
+                number: 40,
+                hash: B256::with_last_byte(40),
+            }),
+        };
+
+        producer.publish_forkchoice_applied(view);
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            FeedEvent::ForkchoiceApplied {
+                generation: 7,
+                view: observed,
+                ..
+            } if observed == view
         ));
     }
 }

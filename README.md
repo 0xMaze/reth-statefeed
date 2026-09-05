@@ -5,7 +5,7 @@ of selected physical storage slots to local consumers. It is protocol-agnostic: 
 already-derived 32-byte storage keys live in TOML, while PSM/GSM formulas and routing decisions
 remain downstream.
 
-The node uses the isolated fork commit `6d512bdb2bdb442228201c7bb7765009bcd8299e`, a two-commit
+The node uses the isolated fork commit `3de74507098383427f8459940a4fe106e4139316`, a three-commit
 patch series on top of the exact upstream Reth `v2.5.2` commit
 `5a6940e351fed80458fe6c9da8581cbe4b8bd036`.
 It uses the stock Reth datadir and CLI; no slots are compiled into the binary.
@@ -20,14 +20,20 @@ The implemented path publishes:
 - a full `VALIDATED` projection when the early observer is disabled or a Reth insertion path does
   not pass through it;
 - a full self-contained projection on every `CANONICAL` transition;
+- a `ForkchoiceApplied` ordering fence for every applied `VALID` FCU, including same-head
+  reaffirmations, with resolved head/safe/finalized checkpoints;
+- exact `CandidatesRetired` batches for local projection eviction, TTL expiry, and finalized-fork
+  conflicts;
 - a machine-readable `REJECTED` notification for invalid blocks/payloads;
 - explicit `Gap` followed by a fresh snapshot after engine-queue loss;
 - atomic watch-set generations on file changes or `SIGHUP`.
 
 Set `stream.publish_executed = true` at startup to advertise `CAP_EXECUTED` and enable the earliest
-pre-state-root stream. It defaults to `false` for a controlled rollout. The Reth fork contains only
-a generic execution-observer hook and complete canonical-head hook coverage; it has no knowledge of
-slots, statefeed, protobuf, or transport.
+pre-state-root stream. Protocol v2 always advertises `CAP_FORKCHOICE_APPLIED` and
+`CAP_CANDIDATE_RETIREMENT`, so consumers can cancel work on non-selected candidates without
+mistaking a temporary choice for permanent invalidity. It defaults to `false` for a controlled
+rollout. The Reth fork contains only generic execution, canonical-head, and applied-forkchoice
+hooks; it has no knowledge of slots, statefeed, protobuf, or transport.
 
 ## Latency design
 
@@ -46,7 +52,10 @@ without racing the child's insertion into the engine tree.
 The publisher runs on its own OS thread. It can be pinned to a reserved logical CPU and optionally
 busy-spin for a short interval before parking. Watched lookups scan the smaller of the account's
 storage diff and its configured slots. Candidate projections are kept as one packed buffer and
-protobuf serialization is done once per event; all consumers share that encoded frame.
+protobuf serialization is done once per event; all consumers share that encoded frame. Candidate
+ancestry uses a parent-to-children index, so subtree rejection is proportional to the removed
+branch rather than the whole cache. Reaffirmed FCUs perform fixed-size work; finality scans run only
+when the finalized checkpoint changes.
 
 ## Build
 
@@ -82,6 +91,9 @@ socket = "/run/reth-statefeed/statefeed.sock"
 socket_mode = 0o660
 queue_capacity = 8192
 candidate_cache_blocks = 128
+candidate_metadata_entries = 1024
+candidate_retention = "2m"
+retirement_work_budget = 256
 consumer_buffer = 256
 max_consumers = 64
 max_frame_bytes = 4194304
@@ -100,9 +112,12 @@ The socket defaults to mode `0660`. Its parent directory is created when missing
 `socket_mode` and the process user/group so only the intended local consumers can connect.
 
 Buffer counts are hard bounds, but their byte cost depends on the watch set. Size them together:
-roughly `candidate_cache_blocks * projection_bytes + consumer_buffer * max_frame_bytes`, plus up to
-`queue_capacity` sparse deltas. Keep `max_frame_bytes` close to the validated frame requirement for
-the configured dictionary instead of treating the 4 MiB default as a target allocation.
+roughly `candidate_cache_blocks * projection_bytes + consumer_buffer * max_frame_bytes`, plus
+`candidate_metadata_entries` compact ancestry records and up to `queue_capacity` sparse deltas.
+`candidate_metadata_entries` must be at least `candidate_cache_blocks`; the former bounds fork
+lifecycle knowledge while the latter bounds full projection memory. Keep `max_frame_bytes` close
+to the validated frame requirement for the configured dictionary instead of treating the 4 MiB
+default as a target allocation.
 
 ## Run and migrate from stock Reth
 
@@ -134,7 +149,7 @@ latest coalesced request, so a valid reload is not silently lost.
 
 ## Consume
 
-The canonical schema is [`proto/statefeed/v1/statefeed.proto`](proto/statefeed/v1/statefeed.proto).
+The canonical schema is [`proto/statefeed/v2/statefeed.proto`](proto/statefeed/v2/statefeed.proto).
 Messages use a four-byte big-endian length prefix followed by protobuf. Every projection stores
 exactly `32 * key_count` big-endian bytes; key `i` occupies `values[i*32..(i+1)*32]`.
 
@@ -158,8 +173,11 @@ Consumers must discard state on a changed `boot_id`, never mix generations or bl
 stop treating old state as authoritative after `Gap` until the following `Snapshot` arrives.
 Connections accepted while recovery is between those two events are closed and should reconnect;
 this prevents a stale pre-gap snapshot from being presented as authoritative. Concurrent consumers
-are bounded by `stream.max_consumers`. Speculative candidates also need a downstream TTL: bounded
-publisher-cache eviction is not a protocol rejection and therefore emits no terminal event.
+are bounded by `stream.max_consumers`. A consumer may cancel speculative computation after a newer
+`ForkchoiceApplied` selects another head, but must allow that candidate hash to be selected by a
+later FCU. Permanent removal is driven only by `BlockRejected`, `CandidatesRetired`, a generation
+change, a gap, or a changed `boot_id`; cache eviction and TTL are explicit retirement reasons, not
+consensus rejection.
 
 ## Metrics and benchmarks
 
@@ -176,7 +194,7 @@ cargo bench --locked --bench hot_path
 ```
 
 They cover 10, 100, 1,000, and 10,000 watched keys with untouched, sparse, all-changed, and
-distributed-address bundles, plus an extraction/enqueue/dequeue round trip. Treat local results as
-a single-thread regression signal, not production queue latency; final p99 targets must be measured
-on the production-like Linux host. Recorded baselines are in
+distributed-address bundles, plus execution and fixed-size forkchoice enqueue/dequeue round trips.
+Treat local results as a single-thread regression signal, not production queue latency; final p99
+targets must be measured on the production-like Linux host. Recorded baselines are in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

@@ -4,6 +4,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use alloy_primitives::{Address, B256};
@@ -35,6 +36,13 @@ pub struct StreamConfig {
     pub queue_capacity: usize,
     /// Number of candidate projections retained for forks and reorgs.
     pub candidate_cache_blocks: usize,
+    /// Number of lightweight candidate ancestry records retained after projection eviction.
+    pub candidate_metadata_entries: usize,
+    /// Maximum local lifetime of a non-canonical candidate without a fresh observation.
+    #[serde(with = "humantime_serde")]
+    pub candidate_retention: Duration,
+    /// Maximum number of metadata records retired by one maintenance pass.
+    pub retirement_work_budget: usize,
     /// Broadcast frames retained in the shared ring for lagging consumers.
     pub consumer_buffer: usize,
     /// Maximum number of concurrently connected local consumers.
@@ -55,6 +63,9 @@ impl Default for StreamConfig {
             socket_mode: 0o660,
             queue_capacity: 8_192,
             candidate_cache_blocks: 128,
+            candidate_metadata_entries: 1_024,
+            candidate_retention: Duration::from_secs(120),
+            retirement_work_budget: 256,
             consumer_buffer: 256,
             max_consumers: 64,
             max_frame_bytes: 4 * 1024 * 1024,
@@ -192,6 +203,22 @@ impl StreamConfig {
                 "stream.candidate_cache_blocks must be at least 2".into(),
             ));
         }
+        if self.candidate_metadata_entries < self.candidate_cache_blocks {
+            return Err(ConfigError::Invalid(
+                "stream.candidate_metadata_entries must be at least stream.candidate_cache_blocks"
+                    .into(),
+            ));
+        }
+        if self.candidate_retention.is_zero() {
+            return Err(ConfigError::Invalid(
+                "stream.candidate_retention must be positive".into(),
+            ));
+        }
+        if self.retirement_work_budget == 0 {
+            return Err(ConfigError::Invalid(
+                "stream.retirement_work_budget must be positive".into(),
+            ));
+        }
         if self.max_frame_bytes < 1024 {
             return Err(ConfigError::Invalid(
                 "stream.max_frame_bytes must be at least 1024".into(),
@@ -268,6 +295,25 @@ mod tests {
 
         let stream = StreamConfig {
             max_consumers: 0,
+            ..Default::default()
+        };
+        assert!(matches!(stream.validate(), Err(ConfigError::Invalid(_))));
+
+        let stream = StreamConfig {
+            candidate_cache_blocks: 16,
+            candidate_metadata_entries: 8,
+            ..Default::default()
+        };
+        assert!(matches!(stream.validate(), Err(ConfigError::Invalid(_))));
+
+        let stream = StreamConfig {
+            candidate_retention: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(matches!(stream.validate(), Err(ConfigError::Invalid(_))));
+
+        let stream = StreamConfig {
+            retirement_work_budget: 0,
             ..Default::default()
         };
         assert!(matches!(stream.validate(), Err(ConfigError::Invalid(_))));

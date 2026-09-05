@@ -1,7 +1,7 @@
 //! Projection assembly, bounded fan-out, and Unix socket serving.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fs,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     os::unix::net::UnixStream as StdUnixStream,
@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use eyre::{Context, Result, eyre};
 use metrics::{Counter, Gauge, Histogram};
 use notify::Watcher;
+use smallvec::SmallVec;
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
@@ -32,12 +33,14 @@ use uuid::Uuid;
 
 use crate::{
     config::{Config, StreamConfig},
-    feed::{ActivationRequest, BlockMeta, FeedEvent, FeedProducer},
+    feed::{ActivationRequest, BlockMeta, CheckpointMeta, FeedEvent, FeedProducer, ForkchoiceMeta},
     watch::{BlockChanges, WatchSet},
     wire::{
-        self, BlockRef, BlockRejected, BlockStage, BlockState, BlockValidated, CAP_CANONICAL,
-        CAP_EXECUTED, CAP_FULL_PROJECTIONS, CAP_REJECTED, CAP_VALIDATED, CanonicalHead,
-        ConfigActivated, Envelope, Gap, Hello, PROTOCOL_VERSION, Snapshot, WatchKey, envelope,
+        self, BlockRef, BlockRejected, BlockStage, BlockState, BlockValidated,
+        CAP_CANDIDATE_RETIREMENT, CAP_CANONICAL, CAP_EXECUTED, CAP_FORKCHOICE_APPLIED,
+        CAP_FULL_PROJECTIONS, CAP_REJECTED, CAP_VALIDATED, CandidatesRetired, CanonicalHead,
+        CheckpointRef, ConfigActivated, Envelope, ForkchoiceApplied, ForkchoiceView, Gap, Hello,
+        PROTOCOL_VERSION, RetirementReason, Snapshot, WatchKey, envelope,
     },
 };
 
@@ -64,6 +67,8 @@ pub struct CanonicalSnapshot {
     /// Canonical callbacks observed no later than this instant are already covered by the
     /// snapshot. Later callbacks must be replayed even if they carry the previous generation.
     pub anchored_at: Instant,
+    /// Head/safe/finalized view confirmed around the same provider reads as `projection`.
+    pub forkchoice: ForkchoiceMeta,
 }
 
 /// Synchronous provider abstraction used outside the engine hot path.
@@ -78,6 +83,11 @@ pub trait SnapshotSource: Send + Sync + 'static {
 #[derive(Debug)]
 struct PublishedState {
     canonical: Arc<Projection>,
+    /// Latest complete forkchoice view coherent with `canonical`.
+    ///
+    /// This is temporarily absent after `CanonicalHead` and before its matching
+    /// `ForkchoiceApplied`; new handshakes are refused during that narrow interval.
+    forkchoice: Option<ForkchoiceMeta>,
     /// First global stream sequence whose effects are included in `canonical`.
     effective_sequence: u64,
     /// A gap was committed and no replacement snapshot has been committed yet.
@@ -111,7 +121,12 @@ struct Shared {
     metrics: PublisherMetrics,
 }
 
-const BASE_CAPABILITIES: u64 = CAP_FULL_PROJECTIONS | CAP_VALIDATED | CAP_CANONICAL | CAP_REJECTED;
+const BASE_CAPABILITIES: u64 = CAP_FULL_PROJECTIONS
+    | CAP_VALIDATED
+    | CAP_CANONICAL
+    | CAP_REJECTED
+    | CAP_FORKCHOICE_APPLIED
+    | CAP_CANDIDATE_RETIREMENT;
 
 const fn advertised_capabilities(publish_executed: bool) -> u64 {
     BASE_CAPABILITIES | if publish_executed { CAP_EXECUTED } else { 0 }
@@ -124,6 +139,7 @@ struct PublisherMetrics {
     validated_end_to_end: Histogram,
     executed_end_to_end: Histogram,
     canonical_end_to_end: Histogram,
+    forkchoice_end_to_end: Histogram,
     rejected_end_to_end: Histogram,
     snapshot_duration: Histogram,
     socket_send_duration: Histogram,
@@ -133,12 +149,15 @@ struct PublisherMetrics {
     executed_events: Counter,
     canonical_events: Counter,
     rejected_events: Counter,
+    forkchoice_events: Counter,
+    retired_candidates: Counter,
     snapshot_events: Counter,
     config_events: Counter,
     gap_events: Counter,
     consumer_gaps: Counter,
     candidate_parent_cache_misses: Counter,
     candidates_cached: Gauge,
+    candidate_projections_cached: Gauge,
     connected_consumers: Gauge,
     config_generation: Gauge,
 }
@@ -162,6 +181,10 @@ impl PublisherMetrics {
                 "statefeed.latency.end_to_end_seconds",
                 "event" => "canonical"
             ),
+            forkchoice_end_to_end: metrics::histogram!(
+                "statefeed.latency.end_to_end_seconds",
+                "event" => "forkchoice_applied"
+            ),
             rejected_end_to_end: metrics::histogram!(
                 "statefeed.latency.end_to_end_seconds",
                 "event" => "rejected"
@@ -180,6 +203,11 @@ impl PublisherMetrics {
                 "type" => "canonical"
             ),
             rejected_events: metrics::counter!("statefeed.events.total", "type" => "rejected"),
+            forkchoice_events: metrics::counter!(
+                "statefeed.events.total",
+                "type" => "forkchoice_applied"
+            ),
+            retired_candidates: metrics::counter!("statefeed.candidates.retired_total"),
             snapshot_events: metrics::counter!("statefeed.events.total", "type" => "snapshot"),
             config_events: metrics::counter!("statefeed.events.total", "type" => "config"),
             gap_events: metrics::counter!("statefeed.events.total", "type" => "gap"),
@@ -188,6 +216,9 @@ impl PublisherMetrics {
                 "statefeed.candidates.parent_cache_misses_total"
             ),
             candidates_cached: metrics::gauge!("statefeed.candidates.cached"),
+            candidate_projections_cached: metrics::gauge!(
+                "statefeed.candidates.projections_cached"
+            ),
             connected_consumers: metrics::gauge!("statefeed.consumers.connected"),
             config_generation: metrics::gauge!("statefeed.config.generation"),
         }
@@ -206,6 +237,11 @@ impl PublisherMetrics {
             envelope::Event::ConfigActivated(_) => self.config_events.increment(1),
             envelope::Event::Gap(_) => self.gap_events.increment(1),
             envelope::Event::BlockRejected(_) => self.rejected_events.increment(1),
+            envelope::Event::ForkchoiceApplied(_) => self.forkchoice_events.increment(1),
+            envelope::Event::CandidatesRetired(event) => {
+                self.retired_candidates
+                    .increment(event.block_hashes.len() as u64);
+            }
             envelope::Event::Hello(_) => {}
         }
     }
@@ -237,16 +273,17 @@ impl Shared {
         generation: u64,
         event: envelope::Event,
         canonical: Arc<Projection>,
+        forkchoice: Option<ForkchoiceMeta>,
         recovering: bool,
     ) -> Result<u64> {
-        self.publish_inner(generation, event, Some((canonical, recovering)))
+        self.publish_inner(generation, event, Some((canonical, forkchoice, recovering)))
     }
 
     fn publish_inner(
         &self,
         generation: u64,
         event: envelope::Event,
-        next_state: Option<(Arc<Projection>, bool)>,
+        next_state: Option<(Arc<Projection>, Option<ForkchoiceMeta>, bool)>,
     ) -> Result<u64> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         let envelope = self.envelope(sequence, generation, event);
@@ -259,13 +296,14 @@ impl Shared {
             .record_event(envelope.event.as_ref().expect("event is always populated"));
         self.metrics.frame_bytes.record(frame.len() as f64);
         self.metrics.published_frames.increment(1);
-        if let Some((canonical, recovering)) = next_state {
+        if let Some((canonical, forkchoice, recovering)) = next_state {
             // Publish projection/recovery state before committing its sequence. An acquire load of
             // `published_sequence` can therefore never observe the transition without also being
             // able to observe the matching handshake state. `effective_sequence` handles the
             // inverse race, where the ArcSwap update is observed before the baseline load.
             self.published.store(Arc::new(PublishedState {
                 canonical,
+                forkchoice,
                 effective_sequence: sequence,
                 recovering,
             }));
@@ -346,10 +384,12 @@ pub async fn start_service(
     let snapshot_started = Instant::now();
     let initial_snapshot = load_latest(Arc::clone(&source), Arc::clone(&watch_set)).await?;
     validate_projection_dictionary(&initial_snapshot.projection, &watch_set)?;
+    validate_snapshot_view(&initial_snapshot)?;
     metrics
         .snapshot_duration
         .record(snapshot_started.elapsed().as_secs_f64());
     let initial_anchored_at = initial_snapshot.anchored_at;
+    let initial_forkchoice = initial_snapshot.forkchoice;
     let initial = Arc::new(initial_snapshot.projection);
     metrics
         .config_generation
@@ -367,20 +407,21 @@ pub async fn start_service(
         capabilities: advertised_capabilities(stream_config.publish_executed),
         published: ArcSwap::from_pointee(PublishedState {
             canonical: Arc::clone(&initial),
+            forkchoice: Some(initial_forkchoice),
             effective_sequence: 0,
             recovering: false,
         }),
         frames,
         metrics,
     });
-    validate_handshake_frames(&shared, &initial)?;
+    validate_handshake_frames(&shared, &initial, initial_forkchoice)?;
     let (listener, socket_cleanup) = bind_socket(&stream_config.socket, stream_config.socket_mode)?;
 
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (publisher_shutdown, publisher_shutdown_rx) = crossbeam_channel::bounded(1);
     let publisher_cpu = stream_config.publisher_cpu;
     let spin_duration = Duration::from_micros(stream_config.publisher_spin_us);
-    let candidate_cache_blocks = stream_config.candidate_cache_blocks;
+    let candidate_policy = CandidatePolicy::from(&stream_config);
     let publisher_thread = thread::Builder::new()
         .name("statefeed-publisher".into())
         .spawn({
@@ -394,7 +435,8 @@ pub async fn start_service(
                     shared,
                     initial,
                     initial_anchored_at,
-                    cache_limit: candidate_cache_blocks,
+                    initial_forkchoice,
+                    candidate_policy,
                     shutdown: publisher_shutdown_rx,
                     publisher_cpu,
                     spin_duration,
@@ -447,10 +489,30 @@ struct PublisherThread {
     shared: Arc<Shared>,
     initial: Arc<Projection>,
     initial_anchored_at: Instant,
-    cache_limit: usize,
+    initial_forkchoice: ForkchoiceMeta,
+    candidate_policy: CandidatePolicy,
     shutdown: Receiver<()>,
     publisher_cpu: Option<usize>,
     spin_duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidatePolicy {
+    projection_limit: usize,
+    metadata_limit: usize,
+    retention: Duration,
+    work_budget: usize,
+}
+
+impl From<&StreamConfig> for CandidatePolicy {
+    fn from(stream: &StreamConfig) -> Self {
+        Self {
+            projection_limit: stream.candidate_cache_blocks,
+            metadata_limit: stream.candidate_metadata_entries,
+            retention: stream.candidate_retention,
+            work_budget: stream.retirement_work_budget,
+        }
+    }
 }
 
 fn run_publisher(thread: PublisherThread) {
@@ -461,7 +523,8 @@ fn run_publisher(thread: PublisherThread) {
         shared,
         initial,
         initial_anchored_at,
-        cache_limit,
+        initial_forkchoice,
+        candidate_policy,
         shutdown,
         publisher_cpu,
         spin_duration,
@@ -472,21 +535,31 @@ fn run_publisher(thread: PublisherThread) {
         warn!(target: "statefeed", cpu, "failed to pin statefeed publisher thread");
     }
 
-    let mut publisher = Publisher::new(
+    let mut publisher = Publisher::new_configured(
         producer,
         source,
         shared,
         initial,
         initial_anchored_at,
-        cache_limit,
+        initial_forkchoice,
+        candidate_policy,
     );
     let loss_notifications = publisher.producer.loss_notifications();
+    let maintenance_interval = candidate_policy
+        .retention
+        .checked_div(4)
+        .unwrap_or(Duration::from_millis(10))
+        .clamp(Duration::from_millis(10), Duration::from_secs(1));
+    let maintenance = crossbeam_channel::tick(maintenance_interval);
 
     loop {
         if shutdown_requested(&shutdown) {
             break;
         }
         if !recover_pending_loss(&mut publisher, &shutdown) {
+            break;
+        }
+        if maintenance.try_recv().is_ok() && !run_maintenance(&mut publisher, &shutdown) {
             break;
         }
         let event = match receiver.try_recv() {
@@ -522,6 +595,12 @@ fn run_publisher(thread: PublisherThread) {
                     None => crossbeam_channel::select! {
                         recv(shutdown) -> _ => break,
                         recv(loss_notifications) -> _ => continue,
+                        recv(maintenance) -> _ => {
+                            if !run_maintenance(&mut publisher, &shutdown) {
+                                break;
+                            }
+                            continue;
+                        },
                         recv(receiver) -> event => match event {
                             Ok(event) => event,
                             Err(_) => break,
@@ -541,6 +620,14 @@ fn run_publisher(thread: PublisherThread) {
             }
         }
     }
+}
+
+fn run_maintenance(publisher: &mut Publisher, shutdown: &Receiver<()>) -> bool {
+    if let Err(error) = publisher.maintain() {
+        error!(target: "statefeed", %error, "failed to maintain candidate lifecycle");
+        return publisher.recover_until_success("candidate_maintenance_error", shutdown);
+    }
+    true
 }
 
 fn recover_pending_loss(publisher: &mut Publisher, shutdown: &Receiver<()>) -> bool {
@@ -574,22 +661,48 @@ struct Publisher {
     shared: Arc<Shared>,
     candidates: HashMap<B256, CandidateEntry>,
     deferred_executed: HashMap<B256, DeferredExecuted>,
-    insertion_order: VecDeque<B256>,
+    children_by_parent: HashMap<B256, SmallVec<[B256; 2]>>,
+    projection_order: VecDeque<(u64, B256)>,
+    metadata_order: VecDeque<(u64, B256)>,
+    tombstones: HashSet<B256>,
+    tombstone_order: VecDeque<B256>,
+    next_incarnation: u64,
+    projection_count: usize,
     cache_limit: usize,
+    metadata_limit: usize,
+    candidate_retention: Duration,
+    retirement_work_budget: usize,
     canonical_hash: B256,
+    last_finalized: Option<CheckpointMeta>,
+    finality_sweep: Option<FinalitySweep>,
     snapshot_anchored_at: Instant,
 }
 
 #[derive(Debug)]
 struct CandidateEntry {
-    projection: Arc<Projection>,
+    block: BlockMeta,
+    projection: Option<Arc<Projection>>,
     stage: CandidateStage,
+    /// True while consumers are expected to retain this candidate.
+    tracked: bool,
+    /// First sequence of the current consumer-visible lifecycle incarnation.
+    first_sequence: u64,
+    incarnation: u64,
+    expires_at: Instant,
 }
 
 #[derive(Debug)]
 struct DeferredExecuted {
     block: BlockMeta,
     changes: BlockChanges,
+    incarnation: u64,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct FinalitySweep {
+    checkpoint: CheckpointMeta,
+    pending: VecDeque<(u64, B256)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,6 +721,64 @@ impl CandidateStage {
 }
 
 impl Publisher {
+    fn new_configured(
+        producer: FeedProducer,
+        source: Arc<dyn SnapshotSource>,
+        shared: Arc<Shared>,
+        initial: Arc<Projection>,
+        initial_anchored_at: Instant,
+        initial_forkchoice: ForkchoiceMeta,
+        policy: CandidatePolicy,
+    ) -> Self {
+        let CandidatePolicy {
+            projection_limit: cache_limit,
+            metadata_limit,
+            retention: candidate_retention,
+            work_budget: retirement_work_budget,
+        } = policy;
+        let canonical_hash = initial.block.hash;
+        let mut candidates = HashMap::default();
+        candidates.reserve(metadata_limit);
+        candidates.insert(
+            canonical_hash,
+            CandidateEntry {
+                block: initial.block,
+                projection: Some(Arc::clone(&initial)),
+                stage: CandidateStage::Validated,
+                tracked: true,
+                first_sequence: 0,
+                incarnation: 1,
+                expires_at: Instant::now() + candidate_retention,
+            },
+        );
+        let projection_order = VecDeque::from([(1, canonical_hash)]);
+        let publisher = Self {
+            producer,
+            source,
+            shared,
+            candidates,
+            deferred_executed: HashMap::default(),
+            children_by_parent: HashMap::default(),
+            projection_order,
+            metadata_order: VecDeque::from([(1, canonical_hash)]),
+            tombstones: HashSet::with_capacity(metadata_limit),
+            tombstone_order: VecDeque::with_capacity(metadata_limit),
+            next_incarnation: 2,
+            projection_count: 1,
+            cache_limit,
+            metadata_limit,
+            candidate_retention,
+            retirement_work_budget,
+            canonical_hash,
+            last_finalized: initial_forkchoice.finalized,
+            finality_sweep: None,
+            snapshot_anchored_at: initial_anchored_at,
+        };
+        publisher.update_candidate_metric();
+        publisher
+    }
+
+    #[cfg(test)]
     fn new(
         producer: FeedProducer,
         source: Arc<dyn SnapshotSource>,
@@ -616,34 +787,28 @@ impl Publisher {
         initial_anchored_at: Instant,
         cache_limit: usize,
     ) -> Self {
-        let canonical_hash = initial.block.hash;
-        let mut candidates = HashMap::default();
-        candidates.reserve(cache_limit);
-        candidates.insert(
-            canonical_hash,
-            CandidateEntry {
-                projection: Arc::clone(&initial),
-                stage: CandidateStage::Validated,
+        let initial_forkchoice = ForkchoiceMeta {
+            head: CheckpointMeta {
+                number: initial.block.number,
+                hash: initial.block.hash,
             },
-        );
-        let insertion_order = VecDeque::from([canonical_hash]);
-        let publisher = Self {
+            safe: None,
+            finalized: None,
+        };
+        Self::new_configured(
             producer,
             source,
             shared,
-            candidates,
-            deferred_executed: HashMap::default(),
-            insertion_order,
-            cache_limit,
-            canonical_hash,
-            snapshot_anchored_at: initial_anchored_at,
-        };
-        publisher
-            .shared
-            .metrics
-            .candidates_cached
-            .set(publisher.candidates.len() as f64);
-        publisher
+            initial,
+            initial_anchored_at,
+            initial_forkchoice,
+            CandidatePolicy {
+                projection_limit: cache_limit,
+                metadata_limit: cache_limit.saturating_mul(8),
+                retention: Duration::from_secs(120),
+                work_budget: 256,
+            },
+        )
     }
 
     fn handle(&mut self, event: FeedEvent) -> Result<()> {
@@ -716,6 +881,20 @@ impl Publisher {
                 }
                 Ok(())
             }
+            FeedEvent::ForkchoiceApplied {
+                observed_at,
+                generation,
+                view,
+            } => {
+                let published = self.forkchoice_applied(generation, observed_at, view)?;
+                if published {
+                    self.shared
+                        .metrics
+                        .forkchoice_end_to_end
+                        .record(observed_at.elapsed().as_secs_f64());
+                }
+                Ok(())
+            }
             FeedEvent::Rejected {
                 observed_at,
                 generation,
@@ -769,20 +948,35 @@ impl Publisher {
                 active_generation
             ));
         }
-        if let Some(candidate) = self.candidates.get(&block.hash) {
-            if stage == CandidateStage::Validated && candidate.stage == CandidateStage::Executed {
-                return self.promote_validated(generation, block.hash);
-            }
+        if self.tombstones.contains(&block.hash) {
             return Ok(false);
+        }
+        if let Some(candidate) = self.candidates.get(&block.hash) {
+            if candidate.block != block {
+                return Err(eyre!(
+                    "candidate hash {} was observed with inconsistent block metadata",
+                    block.hash
+                ));
+            }
+            if candidate.projection.is_some() {
+                if stage == CandidateStage::Validated && candidate.stage == CandidateStage::Executed
+                {
+                    return self.promote_validated(generation, block.hash);
+                }
+                return Ok(false);
+            }
         }
         if block.number <= canonical_number && !self.candidates.contains_key(&block.parent_hash) {
             // Buffered validation output can predate the initial snapshot taken after node launch.
             return Ok(false);
         }
 
-        let mut values = if let Some(parent) = self.candidates.get(&block.parent_hash) {
+        let mut values = if let Some(parent) = self
+            .candidates
+            .get(&block.parent_hash)
+            .and_then(|candidate| candidate.projection.as_ref())
+        {
             let expected_number = parent
-                .projection
                 .block
                 .number
                 .checked_add(1)
@@ -792,19 +986,19 @@ impl Publisher {
                     "invalid projection ancestry for {}: parent {} is block {}, child is block {}",
                     block.hash,
                     block.parent_hash,
-                    parent.projection.block.number,
+                    parent.block.number,
                     block.number
                 ));
             }
-            if parent.projection.watch_set.generation() != generation
-                || parent.projection.values.len() != watch_set.len().saturating_mul(32)
+            if parent.watch_set.generation() != generation
+                || parent.values.len() != watch_set.len().saturating_mul(32)
             {
                 return Err(eyre!(
                     "watch generation mismatch while projecting block {}",
                     block.hash
                 ));
             }
-            parent.projection.values.to_vec()
+            parent.values.to_vec()
         } else {
             if stage == CandidateStage::Executed {
                 // An early candidate is not guaranteed to be queryable by hash yet. A missing
@@ -820,7 +1014,7 @@ impl Publisher {
                     parent = %block.parent_hash,
                     "deferring executed candidate because its parent is not cached"
                 );
-                self.insert_deferred_executed(block, BlockChanges::from_slice(changes));
+                self.insert_deferred_executed(block, BlockChanges::from_slice(changes))?;
                 return Ok(false);
             }
             // A bounded fork cache can legitimately evict a late candidate's parent. Read that
@@ -896,7 +1090,7 @@ impl Publisher {
             changed_bitmap: Bytes::from(changed_bitmap),
         });
 
-        self.shared.publish(
+        let first_sequence = self.shared.publish(
             generation,
             envelope::Event::BlockState(block_state(&projection, stage.wire())),
         )?;
@@ -904,7 +1098,7 @@ impl Publisher {
             .metrics
             .projection_duration
             .record(projection_started.elapsed().as_secs_f64());
-        self.insert_candidate(projection, stage);
+        self.insert_candidate(projection, stage, true, first_sequence)?;
         Ok(true)
     }
 
@@ -939,7 +1133,14 @@ impl Publisher {
             if candidate.stage == CandidateStage::Validated {
                 return Ok(false);
             }
-            if candidate.projection.watch_set.generation() != generation {
+            let Some(projection) = candidate.projection.as_ref() else {
+                self.candidates
+                    .get_mut(&block_hash)
+                    .expect("candidate exists until this synchronous update")
+                    .stage = CandidateStage::Validated;
+                return Ok(false);
+            };
+            if projection.watch_set.generation() != generation {
                 return Ok(false);
             }
 
@@ -980,6 +1181,8 @@ impl Publisher {
 
         let snapshot_started = Instant::now();
         let loaded = self.source.load_latest(Arc::clone(&watch_set))?;
+        validate_snapshot_view(&loaded)?;
+        let forkchoice = loaded.forkchoice;
         let projection = Arc::new(loaded.projection);
         validate_projection_dictionary(&projection, &watch_set)?;
         self.shared
@@ -987,16 +1190,12 @@ impl Publisher {
             .snapshot_duration
             .record(snapshot_started.elapsed().as_secs_f64());
         let config_event = envelope::Event::ConfigActivated(config_activated(&watch_set));
-        let snapshot_event = envelope::Event::Snapshot(snapshot(&projection));
+        let snapshot_event = envelope::Event::Snapshot(snapshot(&projection, forkchoice));
         validate_event_frame(&self.shared, watch_set.generation(), config_event.clone())?;
-        validate_projection_frames(&self.shared, &projection)?;
+        validate_projection_frames(&self.shared, &projection, forkchoice)?;
 
         self.snapshot_anchored_at = loaded.anchored_at;
-        self.canonical_hash = projection.block.hash;
-        self.candidates.clear();
-        self.deferred_executed.clear();
-        self.insertion_order.clear();
-        self.insert_candidate(Arc::clone(&projection), CandidateStage::Validated);
+        self.reset_candidates(Arc::clone(&projection), forkchoice);
 
         // Make reconnect handshakes observe the new dictionary and snapshot before advertising it
         // to existing consumers. Live engine events remain on the old generation until activate().
@@ -1004,6 +1203,7 @@ impl Publisher {
             watch_set.generation(),
             config_event,
             Arc::clone(&projection),
+            Some(forkchoice),
             false,
         )?;
         self.shared
@@ -1063,7 +1263,7 @@ impl Publisher {
                 reason: reason.into(),
             }),
         )?;
-        self.remove_candidate_tree(block_hash);
+        self.remove_candidate_tree(block_hash, true);
         Ok(true)
     }
 
@@ -1106,7 +1306,7 @@ impl Publisher {
         let projection = if generation == active_generation {
             self.candidates
                 .get(&block_hash)
-                .map(|candidate| Arc::clone(&candidate.projection))
+                .and_then(|candidate| candidate.projection.as_ref().map(Arc::clone))
         } else {
             // A callback queued while a reload snapshot was being built still carries the old
             // generation. Its old projection cannot be reused, but its canonical transition must
@@ -1137,8 +1337,9 @@ impl Publisher {
 
         let previous = self.canonical_hash;
         self.canonical_hash = block_hash;
-        self.insert_candidate(projection.clone(), CandidateStage::Validated);
-        self.shared.publish_state(
+        self.schedule_expiry(previous);
+        self.insert_candidate(projection.clone(), CandidateStage::Validated, true, 0)?;
+        let sequence = self.shared.publish_state(
             projection.watch_set.generation(),
             envelope::Event::CanonicalHead(CanonicalHead {
                 previous_block_hash: previous.to_vec(),
@@ -1146,9 +1347,79 @@ impl Publisher {
                 values: projection.values.clone(),
                 changed_bitmap,
             }),
-            projection,
+            Arc::clone(&projection),
+            None,
             false,
         )?;
+        if let Some(candidate) = self.candidates.get_mut(&block_hash)
+            && candidate.first_sequence == 0
+        {
+            candidate.first_sequence = sequence;
+        }
+        Ok(true)
+    }
+
+    fn forkchoice_applied(
+        &mut self,
+        generation: u64,
+        observed_at: Instant,
+        view: ForkchoiceMeta,
+    ) -> Result<bool> {
+        validate_forkchoice_checkpoints(view)?;
+        let published = self.shared.published.load();
+        let active_generation = published.canonical.watch_set.generation();
+        drop(published);
+        if generation > active_generation {
+            return Err(eyre!(
+                "received forkchoice generation {generation} before active generation {active_generation}"
+            ));
+        }
+        if observed_at <= self.snapshot_anchored_at {
+            return Ok(false);
+        }
+
+        // Normally CanonicalHead was queued immediately before this event by the same engine
+        // thread. Recover by hash if a future Reth call path emits only the applied-FCU hook.
+        if self.canonical_hash != view.head.hash {
+            self.canonical(generation, observed_at, view.head.number, view.head.hash)?;
+        }
+        let published = self.shared.published.load();
+        if published.canonical.block.hash != view.head.hash
+            || published.canonical.block.number != view.head.number
+        {
+            return Err(eyre!(
+                "applied forkchoice head {}/{} does not match canonical projection {}/{}",
+                view.head.number,
+                view.head.hash,
+                published.canonical.block.number,
+                published.canonical.block.hash
+            ));
+        }
+        let projection = Arc::clone(&published.canonical);
+        let active_generation = projection.watch_set.generation();
+        drop(published);
+
+        // Never deduplicate this event: its sequence is the consumer's forkchoice view id even
+        // when head, safe, and finalized all reaffirm the previous values.
+        self.shared.publish_state(
+            active_generation,
+            envelope::Event::ForkchoiceApplied(ForkchoiceApplied {
+                view: Some(forkchoice_view(view)),
+            }),
+            projection,
+            Some(view),
+            false,
+        )?;
+
+        if view.finalized != self.last_finalized {
+            self.last_finalized = view.finalized;
+            if let Some(finalized) = view.finalized {
+                self.begin_finality_sweep(finalized);
+                self.process_finality_budget(active_generation, self.retirement_work_budget)?;
+            } else {
+                self.finality_sweep = None;
+            }
+        }
         Ok(true)
     }
 
@@ -1164,6 +1435,7 @@ impl Publisher {
                 reason: reason.into(),
             }),
             canonical,
+            None,
             true,
         )?;
         Ok(())
@@ -1173,23 +1445,22 @@ impl Publisher {
         let watch_set = self.shared.published.load().canonical.watch_set.clone();
         let snapshot_started = Instant::now();
         let loaded = self.source.load_latest(Arc::clone(&watch_set))?;
+        validate_snapshot_view(&loaded)?;
+        let forkchoice = loaded.forkchoice;
         let projection = Arc::new(loaded.projection);
         validate_projection_dictionary(&projection, &watch_set)?;
         self.shared
             .metrics
             .snapshot_duration
             .record(snapshot_started.elapsed().as_secs_f64());
-        validate_projection_frames(&self.shared, &projection)?;
+        validate_projection_frames(&self.shared, &projection, forkchoice)?;
         self.snapshot_anchored_at = loaded.anchored_at;
-        self.canonical_hash = projection.block.hash;
-        self.candidates.clear();
-        self.deferred_executed.clear();
-        self.insertion_order.clear();
-        self.insert_candidate(Arc::clone(&projection), CandidateStage::Validated);
+        self.reset_candidates(Arc::clone(&projection), forkchoice);
         self.shared.publish_state(
             projection.watch_set.generation(),
-            envelope::Event::Snapshot(snapshot(&projection)),
+            envelope::Event::Snapshot(snapshot(&projection, forkchoice)),
             projection,
+            Some(forkchoice),
             false,
         )?;
         Ok(())
@@ -1231,80 +1502,488 @@ impl Publisher {
         }
     }
 
-    fn insert_candidate(&mut self, projection: Arc<Projection>, stage: CandidateStage) {
+    fn insert_candidate(
+        &mut self,
+        projection: Arc<Projection>,
+        stage: CandidateStage,
+        tracked: bool,
+        first_sequence: u64,
+    ) -> Result<()> {
+        let generation = projection.watch_set.generation();
         let hash = projection.block.hash;
-        let replaced_deferred = self.deferred_executed.remove(&hash).is_some();
-        if self
+        let block = projection.block;
+        let replaced_deferred = self.deferred_executed.remove(&hash);
+        let existing_incarnation = self
             .candidates
-            .insert(hash, CandidateEntry { projection, stage })
-            .is_none()
-            && !replaced_deferred
-        {
-            self.insertion_order.push_back(hash);
+            .get(&hash)
+            .map(|entry| entry.incarnation)
+            .or_else(|| replaced_deferred.as_ref().map(|entry| entry.incarnation));
+        let incarnation = existing_incarnation.unwrap_or_else(|| self.allocate_incarnation());
+        let expires_at = Instant::now() + self.candidate_retention;
+        let mut gained_projection = true;
+        match self.candidates.entry(hash) {
+            alloy_primitives::map::Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                gained_projection = entry.projection.is_none();
+                entry.block = block;
+                entry.projection = Some(projection);
+                entry.stage = stage;
+                if tracked && !entry.tracked {
+                    entry.first_sequence = first_sequence;
+                }
+                entry.tracked |= tracked;
+                entry.expires_at = expires_at;
+            }
+            alloy_primitives::map::Entry::Vacant(vacant) => {
+                vacant.insert(CandidateEntry {
+                    block,
+                    projection: Some(projection),
+                    stage,
+                    tracked,
+                    first_sequence,
+                    incarnation,
+                    expires_at,
+                });
+                if replaced_deferred.is_none() {
+                    self.add_child(block.parent_hash, hash);
+                }
+                if existing_incarnation.is_none() {
+                    self.metadata_order.push_back((incarnation, hash));
+                    self.queue_finality_check(incarnation, hash);
+                }
+            }
         }
-
-        self.trim_candidate_cache();
+        if gained_projection {
+            self.projection_count += 1;
+            self.projection_order.push_back((incarnation, hash));
+        }
+        self.trim_projection_cache(generation, hash)?;
+        self.trim_metadata(generation)?;
+        self.update_candidate_metric();
+        Ok(())
     }
 
-    fn insert_deferred_executed(&mut self, block: BlockMeta, changes: BlockChanges) {
+    fn insert_deferred_executed(&mut self, block: BlockMeta, changes: BlockChanges) -> Result<()> {
+        if self.tombstones.contains(&block.hash) {
+            return Ok(());
+        }
         let hash = block.hash;
-        if self
-            .deferred_executed
-            .insert(hash, DeferredExecuted { block, changes })
-            .is_none()
-            && !self.candidates.contains_key(&hash)
-        {
-            self.insertion_order.push_back(hash);
+        if !self.candidates.contains_key(&hash) {
+            let existing_incarnation = self
+                .deferred_executed
+                .get(&hash)
+                .map(|entry| entry.incarnation);
+            let incarnation = existing_incarnation.unwrap_or_else(|| self.allocate_incarnation());
+            let inserted = existing_incarnation.is_none();
+            self.deferred_executed.insert(
+                hash,
+                DeferredExecuted {
+                    block,
+                    changes,
+                    incarnation,
+                    expires_at: Instant::now() + self.candidate_retention,
+                },
+            );
+            if inserted {
+                self.add_child(block.parent_hash, hash);
+                self.metadata_order.push_back((incarnation, hash));
+                self.queue_finality_check(incarnation, hash);
+            }
+            let generation = self
+                .shared
+                .published
+                .load()
+                .canonical
+                .watch_set
+                .generation();
+            self.trim_metadata(generation)?;
+            self.update_candidate_metric();
         }
-
-        self.trim_candidate_cache();
+        Ok(())
     }
 
-    fn trim_candidate_cache(&mut self) {
-        while self.candidates.len() + self.deferred_executed.len() > self.cache_limit {
-            let Some(oldest) = self.insertion_order.pop_front() else {
+    fn maintain(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let generation = self
+            .shared
+            .published
+            .load()
+            .canonical
+            .watch_set
+            .generation();
+        let finality_work =
+            self.process_finality_budget(generation, self.retirement_work_budget)?;
+        let ttl_budget = self.retirement_work_budget.saturating_sub(finality_work);
+        let mut due = Vec::with_capacity(ttl_budget);
+        due.extend(
+            self.candidates
+                .iter()
+                .filter(|(hash, entry)| **hash != self.canonical_hash && entry.expires_at <= now)
+                .map(|(hash, _)| *hash)
+                .take(ttl_budget),
+        );
+        if due.len() < ttl_budget {
+            due.extend(
+                self.deferred_executed
+                    .iter()
+                    .filter(|(hash, entry)| {
+                        **hash != self.canonical_hash && entry.expires_at <= now
+                    })
+                    .map(|(hash, _)| *hash)
+                    .take(ttl_budget - due.len()),
+            );
+        }
+        let mut expired = Vec::with_capacity(due.len());
+        for hash in due {
+            if self.remove_one(hash, false) {
+                expired.push(hash);
+            }
+        }
+        self.publish_retired(generation, &expired, RetirementReason::RetentionExpired)?;
+        self.update_candidate_metric();
+        Ok(())
+    }
+
+    fn begin_finality_sweep(&mut self, checkpoint: CheckpointMeta) {
+        self.finality_sweep = Some(FinalitySweep {
+            checkpoint,
+            pending: self.metadata_order.iter().copied().collect(),
+        });
+    }
+
+    fn queue_finality_check(&mut self, incarnation: u64, hash: B256) {
+        if let Some(sweep) = &mut self.finality_sweep {
+            sweep.pending.push_back((incarnation, hash));
+        } else if let Some(checkpoint) = self.last_finalized {
+            self.finality_sweep = Some(FinalitySweep {
+                checkpoint,
+                pending: VecDeque::from([(incarnation, hash)]),
+            });
+        }
+        if self
+            .finality_sweep
+            .as_ref()
+            .is_some_and(|sweep| sweep.pending.len() > self.metadata_limit.saturating_mul(2))
+        {
+            let mut sweep = self
+                .finality_sweep
+                .take()
+                .expect("finality sweep was checked above");
+            sweep.pending.retain(|(incarnation, hash)| {
+                self.current_incarnation(*hash) == Some(*incarnation)
+            });
+            self.finality_sweep = Some(sweep);
+        }
+    }
+
+    fn process_finality_budget(&mut self, generation: u64, budget: usize) -> Result<usize> {
+        let mut work = 0;
+        let mut retired = Vec::new();
+        while work < budget {
+            let Some((checkpoint, incarnation, hash)) =
+                self.finality_sweep.as_mut().and_then(|sweep| {
+                    sweep
+                        .pending
+                        .pop_front()
+                        .map(|(incarnation, hash)| (sweep.checkpoint, incarnation, hash))
+                })
+            else {
+                self.finality_sweep = None;
                 break;
             };
-            if oldest == self.canonical_hash {
-                self.insertion_order.push_back(oldest);
-                continue;
+            work += 1;
+            let current_incarnation = self.current_incarnation(hash);
+            if current_incarnation == Some(incarnation)
+                && hash != self.canonical_hash
+                && self.conflicts_with_finalized(hash, checkpoint)
+                && self.remove_one(hash, true)
+            {
+                retired.push(hash);
             }
-            self.candidates.remove(&oldest);
-            self.deferred_executed.remove(&oldest);
         }
-        self.shared
-            .metrics
-            .candidates_cached
-            .set((self.candidates.len() + self.deferred_executed.len()) as f64);
+        if self
+            .finality_sweep
+            .as_ref()
+            .is_some_and(|sweep| sweep.pending.is_empty())
+        {
+            self.finality_sweep = None;
+        }
+        self.publish_retired(generation, &retired, RetirementReason::FinalizedConflict)?;
+        self.update_candidate_metric();
+        Ok(work)
     }
 
-    fn remove_candidate_tree(&mut self, root: B256) {
+    fn conflicts_with_finalized(&self, hash: B256, finalized: CheckpointMeta) -> bool {
+        let mut current_hash = hash;
+        for _ in 0..self.metadata_limit {
+            let Some(block) = self.block_meta(current_hash) else {
+                return false;
+            };
+            if block.number == finalized.number {
+                return block.hash != finalized.hash;
+            }
+            if block.number < finalized.number {
+                return false;
+            }
+            let Some(expected_parent_number) = block.number.checked_sub(1) else {
+                return false;
+            };
+            let Some(parent) = self.block_meta(block.parent_hash) else {
+                // A consensus-terminal parent makes every descendant terminal as well. This also
+                // preserves classification when a bounded sweep removed the parent earlier in
+                // the same or a previous maintenance iteration.
+                return self.tombstones.contains(&block.parent_hash);
+            };
+            if parent.number != expected_parent_number {
+                return false;
+            }
+            current_hash = parent.hash;
+        }
+        false
+    }
+
+    fn block_meta(&self, hash: B256) -> Option<BlockMeta> {
+        self.candidates
+            .get(&hash)
+            .map(|entry| entry.block)
+            .or_else(|| self.deferred_executed.get(&hash).map(|entry| entry.block))
+    }
+
+    fn current_incarnation(&self, hash: B256) -> Option<u64> {
+        self.candidates
+            .get(&hash)
+            .map(|entry| entry.incarnation)
+            .or_else(|| {
+                self.deferred_executed
+                    .get(&hash)
+                    .map(|entry| entry.incarnation)
+            })
+    }
+
+    fn trim_projection_cache(&mut self, generation: u64, inserted: B256) -> Result<()> {
+        let mut retired = Vec::new();
+        let mut examined = 0;
+        while self.projection_count > self.cache_limit {
+            let Some((incarnation, oldest)) = self.projection_order.pop_front() else {
+                break;
+            };
+            examined += 1;
+            let is_current_projection = self.candidates.get(&oldest).is_some_and(|candidate| {
+                candidate.incarnation == incarnation && candidate.projection.is_some()
+            });
+            if !is_current_projection {
+                continue;
+            }
+            if oldest == self.canonical_hash {
+                self.projection_order.push_back((incarnation, oldest));
+            } else if let Some(candidate) = self.candidates.get_mut(&oldest)
+                && candidate.projection.take().is_some()
+            {
+                self.projection_count -= 1;
+                if candidate.tracked {
+                    candidate.tracked = false;
+                    retired.push(oldest);
+                }
+            }
+            if examined > self.projection_order.len().saturating_add(1) {
+                return Err(eyre!(
+                    "cannot evict candidate projection after inserting {inserted}"
+                ));
+            }
+        }
+        self.publish_retired(generation, &retired, RetirementReason::CacheEvicted)
+    }
+
+    fn trim_metadata(&mut self, generation: u64) -> Result<()> {
+        let mut retired = Vec::new();
+        while self.metadata_len() > self.metadata_limit {
+            let Some((incarnation, hash)) = self.metadata_order.pop_front() else {
+                return Err(eyre!("candidate metadata bound cannot be enforced"));
+            };
+            let current_incarnation = self.current_incarnation(hash);
+            if current_incarnation != Some(incarnation) {
+                continue;
+            }
+            if hash == self.canonical_hash {
+                self.metadata_order.push_back((incarnation, hash));
+                continue;
+            }
+            if self.remove_one(hash, false) {
+                retired.push(hash);
+            }
+        }
+        self.publish_retired(generation, &retired, RetirementReason::CacheEvicted)
+    }
+
+    fn remove_candidate_tree(&mut self, root: B256, consensus_terminal: bool) {
         if root == self.canonical_hash {
             return;
         }
-
-        let mut pending = VecDeque::from([root]);
-        while let Some(parent_hash) = pending.pop_front() {
-            pending.extend(self.candidates.iter().filter_map(|(hash, candidate)| {
-                (candidate.projection.block.parent_hash == parent_hash).then_some(*hash)
-            }));
-            pending.extend(
-                self.deferred_executed
-                    .iter()
-                    .filter_map(|(hash, candidate)| {
-                        (candidate.block.parent_hash == parent_hash).then_some(*hash)
-                    }),
-            );
-            self.candidates.remove(&parent_hash);
-            self.deferred_executed.remove(&parent_hash);
+        let mut pending = vec![root];
+        while let Some(hash) = pending.pop() {
+            if let Some(children) = self.children_by_parent.remove(&hash) {
+                pending.extend(children);
+            }
+            self.remove_one(hash, consensus_terminal);
         }
-        self.insertion_order.retain(|hash| {
-            self.candidates.contains_key(hash) || self.deferred_executed.contains_key(hash)
-        });
+        self.update_candidate_metric();
+    }
+
+    /// Removes one metadata record and returns whether consumers still tracked its projection.
+    fn remove_one(&mut self, hash: B256, consensus_terminal: bool) -> bool {
+        let mut parent = None;
+        let mut tracked = false;
+        if let Some(candidate) = self.candidates.remove(&hash) {
+            parent = Some(candidate.block.parent_hash);
+            tracked = candidate.tracked;
+            if candidate.projection.is_some() {
+                self.projection_count = self.projection_count.saturating_sub(1);
+            }
+        }
+        if let Some(deferred) = self.deferred_executed.remove(&hash) {
+            parent = Some(deferred.block.parent_hash);
+        }
+        if let Some(parent) = parent
+            && let Some(children) = self.children_by_parent.get_mut(&parent)
+        {
+            children.retain(|child| *child != hash);
+            if children.is_empty() {
+                self.children_by_parent.remove(&parent);
+            }
+        }
+        if consensus_terminal {
+            self.insert_tombstone(hash);
+        }
+        self.compact_order_queues_if_needed();
+        tracked
+    }
+
+    fn publish_retired(
+        &self,
+        generation: u64,
+        hashes: &[B256],
+        reason: RetirementReason,
+    ) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        // Keep batches below the configured frame bound even with a deliberately tiny frame.
+        let batch_size = self.shared.max_frame_bytes.saturating_sub(256).max(32) / 34;
+        for batch in hashes.chunks(batch_size.max(1)) {
+            self.shared.publish(
+                generation,
+                envelope::Event::CandidatesRetired(CandidatesRetired {
+                    block_hashes: batch.iter().map(|hash| hash.to_vec()).collect(),
+                    reason: reason as i32,
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn add_child(&mut self, parent: B256, child: B256) {
+        let children = self.children_by_parent.entry(parent).or_default();
+        if !children.contains(&child) {
+            children.push(child);
+        }
+    }
+
+    fn schedule_expiry(&mut self, hash: B256) {
+        if hash == self.canonical_hash {
+            return;
+        }
+        if let Some(candidate) = self.candidates.get_mut(&hash) {
+            candidate.expires_at = Instant::now() + self.candidate_retention;
+        } else if let Some(deferred) = self.deferred_executed.get_mut(&hash) {
+            deferred.expires_at = Instant::now() + self.candidate_retention;
+        }
+    }
+
+    fn allocate_incarnation(&mut self) -> u64 {
+        let incarnation = self.next_incarnation;
+        self.next_incarnation = self.next_incarnation.wrapping_add(1).max(1);
+        incarnation
+    }
+
+    fn insert_tombstone(&mut self, hash: B256) {
+        if self.tombstones.insert(hash) {
+            self.tombstone_order.push_back(hash);
+        }
+        while self.tombstones.len() > self.metadata_limit {
+            if let Some(oldest) = self.tombstone_order.pop_front() {
+                self.tombstones.remove(&oldest);
+            }
+        }
+    }
+
+    fn metadata_len(&self) -> usize {
+        self.candidates.len() + self.deferred_executed.len()
+    }
+
+    fn compact_order_queues_if_needed(&mut self) {
+        if self.metadata_order.len() > self.metadata_limit.saturating_mul(2) {
+            self.metadata_order.retain(|(incarnation, hash)| {
+                self.candidates
+                    .get(hash)
+                    .map(|entry| entry.incarnation)
+                    .or_else(|| {
+                        self.deferred_executed
+                            .get(hash)
+                            .map(|entry| entry.incarnation)
+                    })
+                    == Some(*incarnation)
+            });
+        }
+        if self.projection_order.len() > self.cache_limit.saturating_mul(2) {
+            self.projection_order.retain(|(incarnation, hash)| {
+                self.candidates.get(hash).is_some_and(|entry| {
+                    entry.incarnation == *incarnation && entry.projection.is_some()
+                })
+            });
+        }
+    }
+
+    fn update_candidate_metric(&self) {
         self.shared
             .metrics
             .candidates_cached
-            .set((self.candidates.len() + self.deferred_executed.len()) as f64);
+            .set(self.metadata_len() as f64);
+        self.shared
+            .metrics
+            .candidate_projections_cached
+            .set(self.projection_count as f64);
+    }
+
+    fn reset_candidates(&mut self, projection: Arc<Projection>, view: ForkchoiceMeta) {
+        self.canonical_hash = projection.block.hash;
+        self.last_finalized = view.finalized;
+        self.candidates.clear();
+        self.deferred_executed.clear();
+        self.children_by_parent.clear();
+        self.projection_order.clear();
+        self.metadata_order.clear();
+        self.tombstones.clear();
+        self.tombstone_order.clear();
+        self.finality_sweep = None;
+        self.projection_count = 1;
+        let incarnation = self.allocate_incarnation();
+        self.candidates.insert(
+            projection.block.hash,
+            CandidateEntry {
+                block: projection.block,
+                projection: Some(Arc::clone(&projection)),
+                stage: CandidateStage::Validated,
+                tracked: true,
+                first_sequence: 0,
+                incarnation,
+                expires_at: Instant::now() + self.candidate_retention,
+            },
+        );
+        self.projection_order
+            .push_back((incarnation, projection.block.hash));
+        self.metadata_order
+            .push_back((incarnation, projection.block.hash));
+        self.update_candidate_metric();
     }
 }
 
@@ -1591,7 +2270,11 @@ async fn run_server(
     while consumers.join_next().await.is_some() {}
 }
 
-fn validate_handshake_frames(shared: &Shared, projection: &Projection) -> Result<()> {
+fn validate_handshake_frames(
+    shared: &Shared,
+    projection: &Projection,
+    forkchoice: ForkchoiceMeta,
+) -> Result<()> {
     let generation = projection.watch_set.generation();
     let events = [
         envelope::Event::Hello(Hello {
@@ -1605,11 +2288,15 @@ fn validate_handshake_frames(shared: &Shared, projection: &Projection) -> Result
     for event in events {
         validate_event_frame(shared, generation, event)?;
     }
-    validate_projection_frames(shared, projection)?;
+    validate_projection_frames(shared, projection, forkchoice)?;
     Ok(())
 }
 
-fn validate_projection_frames(shared: &Shared, projection: &Projection) -> Result<()> {
+fn validate_projection_frames(
+    shared: &Shared,
+    projection: &Projection,
+    forkchoice: ForkchoiceMeta,
+) -> Result<()> {
     validate_projection_shape(projection)?;
     let generation = projection.watch_set.generation();
     let mut worst_case_block = block_state(projection, BlockStage::Validated);
@@ -1622,7 +2309,7 @@ fn validate_projection_frames(shared: &Shared, projection: &Projection) -> Resul
         changed_bitmap: worst_case_block.changed_bitmap.clone(),
     };
     for event in [
-        envelope::Event::Snapshot(snapshot(projection)),
+        envelope::Event::Snapshot(snapshot(projection, forkchoice)),
         envelope::Event::BlockState(worst_case_block),
         envelope::Event::CanonicalHead(canonical),
     ] {
@@ -1691,6 +2378,47 @@ fn validate_projection_dictionary(projection: &Projection, expected: &Arc<WatchS
     Ok(())
 }
 
+fn validate_snapshot_view(snapshot: &CanonicalSnapshot) -> Result<()> {
+    let block = snapshot.projection.block;
+    let view = snapshot.forkchoice;
+    if view.head.number != block.number || view.head.hash != block.hash {
+        return Err(eyre!(
+            "snapshot forkchoice head {}/{} does not match projection {}/{}",
+            view.head.number,
+            view.head.hash,
+            block.number,
+            block.hash
+        ));
+    }
+    validate_forkchoice_checkpoints(view)
+}
+
+fn validate_forkchoice_checkpoints(view: ForkchoiceMeta) -> Result<()> {
+    for checkpoint in [view.safe, view.finalized].into_iter().flatten() {
+        if checkpoint.number > view.head.number {
+            return Err(eyre!(
+                "forkchoice checkpoint {}/{} is ahead of head {}/{}",
+                checkpoint.number,
+                checkpoint.hash,
+                view.head.number,
+                view.head.hash
+            ));
+        }
+    }
+    if let (Some(safe), Some(finalized)) = (view.safe, view.finalized)
+        && finalized.number > safe.number
+    {
+        return Err(eyre!(
+            "finalized checkpoint {}/{} is ahead of safe checkpoint {}/{}",
+            finalized.number,
+            finalized.hash,
+            safe.number,
+            safe.hash
+        ));
+    }
+    Ok(())
+}
+
 fn validate_projection_shape(projection: &Projection) -> Result<()> {
     let expected_values = projection
         .watch_set
@@ -1745,6 +2473,18 @@ async fn serve_consumer(
             "statefeed recovery is in progress; reconnect after the replacement snapshot"
         ));
     }
+    let Some(forkchoice) = published.forkchoice else {
+        return Err(eyre!(
+            "statefeed forkchoice transition is in progress; reconnect after ForkchoiceApplied"
+        ));
+    };
+    if forkchoice.head.hash != published.canonical.block.hash
+        || forkchoice.head.number != published.canonical.block.number
+    {
+        return Err(eyre!(
+            "statefeed handshake state has an incoherent canonical/forkchoice head"
+        ));
+    }
     // The ArcSwap transition can become visible just before its sequence is committed. Tagging
     // handshake state with that effective sequence prevents buffered canonical/config frames from
     // replaying an older projection over the newer authoritative snapshot.
@@ -1777,7 +2517,7 @@ async fn serve_consumer(
         &shared,
         baseline,
         generation,
-        envelope::Event::Snapshot(snapshot(&published.canonical)),
+        envelope::Event::Snapshot(snapshot(&published.canonical, forkchoice)),
     )
     .await?;
 
@@ -1852,10 +2592,26 @@ fn config_activated(watch_set: &WatchSet) -> ConfigActivated {
     }
 }
 
-fn snapshot(projection: &Projection) -> Snapshot {
+fn snapshot(projection: &Projection, forkchoice: ForkchoiceMeta) -> Snapshot {
     Snapshot {
         block: Some(block_ref(projection.block)),
         values: projection.values.clone(),
+        forkchoice: Some(forkchoice_view(forkchoice)),
+    }
+}
+
+fn forkchoice_view(view: ForkchoiceMeta) -> ForkchoiceView {
+    ForkchoiceView {
+        head: Some(checkpoint_ref(view.head)),
+        safe: view.safe.map(checkpoint_ref),
+        finalized: view.finalized.map(checkpoint_ref),
+    }
+}
+
+fn checkpoint_ref(checkpoint: CheckpointMeta) -> CheckpointRef {
+    CheckpointRef {
+        number: checkpoint.number,
+        hash: checkpoint.hash.to_vec(),
     }
 }
 
@@ -1937,6 +2693,7 @@ mod tests {
             let mut projection = self.projection.clone();
             projection.watch_set = watch_set;
             Ok(CanonicalSnapshot {
+                forkchoice: forkchoice_for(projection.block),
                 projection,
                 anchored_at: Instant::now(),
             })
@@ -1963,6 +2720,7 @@ mod tests {
             let mut projection = self.projection.clone();
             projection.watch_set = watch_set;
             Ok(CanonicalSnapshot {
+                forkchoice: forkchoice_for(projection.block),
                 projection,
                 anchored_at: Instant::now(),
             })
@@ -1987,10 +2745,28 @@ mod tests {
         ))
     }
 
+    fn forkchoice_for(block: BlockMeta) -> ForkchoiceMeta {
+        ForkchoiceMeta {
+            head: CheckpointMeta {
+                number: block.number,
+                hash: block.hash,
+            },
+            safe: None,
+            finalized: None,
+        }
+    }
+
+    fn decode_published(receiver: &mut broadcast::Receiver<PublishedFrame>) -> Envelope {
+        let frame = receiver.try_recv().expect("expected published frame");
+        Envelope::decode(&frame.bytes[4..]).expect("valid published envelope")
+    }
+
     #[test]
     fn executed_capability_tracks_the_startup_setting() {
         assert_eq!(advertised_capabilities(false) & CAP_EXECUTED, 0);
         assert_ne!(advertised_capabilities(true) & CAP_EXECUTED, 0);
+        assert_ne!(advertised_capabilities(false) & CAP_FORKCHOICE_APPLIED, 0);
+        assert_ne!(advertised_capabilities(false) & CAP_CANDIDATE_RETIREMENT, 0);
         assert_eq!(
             advertised_capabilities(false) | CAP_EXECUTED,
             advertised_capabilities(true)
@@ -2030,6 +2806,7 @@ mod tests {
                 | CAP_REJECTED,
             published: ArcSwap::from_pointee(PublishedState {
                 canonical: Arc::clone(&initial),
+                forkchoice: Some(forkchoice_for(initial.block)),
                 effective_sequence: 0,
                 recovering: false,
             }),
@@ -2078,7 +2855,14 @@ mod tests {
         };
         assert_eq!(BlockStage::try_from(state.stage), Ok(BlockStage::Executed));
         assert_eq!(
-            value_at(&publisher.candidates[&block_hash].projection.values, 0),
+            value_at(
+                &publisher.candidates[&block_hash]
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .values,
+                0,
+            ),
             U256::from(2)
         );
 
@@ -2099,6 +2883,260 @@ mod tests {
         let sequence = shared.published_sequence.load(Ordering::Acquire);
         publisher.promote_validated(1, block_hash).unwrap();
         assert_eq!(shared.published_sequence.load(Ordering::Acquire), sequence);
+    }
+
+    #[test]
+    fn every_applied_forkchoice_is_published_even_when_the_view_is_unchanged() {
+        let (mut publisher, shared, mut frame_rx, initial) = publisher_fixture();
+        let view = forkchoice_for(initial.block);
+
+        assert!(
+            publisher
+                .forkchoice_applied(1, Instant::now(), view)
+                .unwrap()
+        );
+        assert!(
+            publisher
+                .forkchoice_applied(1, Instant::now(), view)
+                .unwrap()
+        );
+
+        let first = decode_published(&mut frame_rx);
+        let second = decode_published(&mut frame_rx);
+        assert!(matches!(
+            first.event,
+            Some(envelope::Event::ForkchoiceApplied(_))
+        ));
+        assert!(matches!(
+            second.event,
+            Some(envelope::Event::ForkchoiceApplied(_))
+        ));
+        assert_eq!(second.sequence, first.sequence + 1);
+        assert_eq!(shared.published.load().forkchoice, Some(view));
+    }
+
+    #[tokio::test]
+    async fn canonical_transition_is_not_exposed_to_new_consumers_before_its_fcu_fence() {
+        let (mut publisher, shared, mut frame_rx, initial) = publisher_fixture();
+        let next = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, next, &[]).unwrap();
+        let _candidate = decode_published(&mut frame_rx);
+
+        publisher
+            .canonical(1, Instant::now(), next.number, next.hash)
+            .unwrap();
+        let canonical = decode_published(&mut frame_rx);
+        assert!(matches!(
+            canonical.event,
+            Some(envelope::Event::CanonicalHead(_))
+        ));
+        assert!(shared.published.load().forkchoice.is_none());
+
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let error = serve_consumer(server, Arc::clone(&shared), shutdown_rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("forkchoice transition"));
+
+        publisher
+            .forkchoice_applied(1, Instant::now(), forkchoice_for(next))
+            .unwrap();
+        let forkchoice = decode_published(&mut frame_rx);
+        assert!(matches!(
+            forkchoice.event,
+            Some(envelope::Event::ForkchoiceApplied(_))
+        ));
+        assert_eq!(forkchoice.sequence, canonical.sequence + 1);
+    }
+
+    #[test]
+    fn finalized_checkpoint_retires_only_provably_conflicting_candidates() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        let selected = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        let sibling = BlockMeta {
+            number: 11,
+            hash: B256::repeat_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        let sibling_child = BlockMeta {
+            number: 12,
+            hash: B256::repeat_byte(12),
+            parent_hash: sibling.hash,
+            timestamp: 12,
+        };
+        for block in [selected, sibling, sibling_child] {
+            publisher.validated(1, block, &[]).unwrap();
+            let _ = decode_published(&mut frame_rx);
+        }
+        publisher
+            .canonical(1, Instant::now(), selected.number, selected.hash)
+            .unwrap();
+        let _canonical = decode_published(&mut frame_rx);
+        let view = ForkchoiceMeta {
+            head: CheckpointMeta {
+                number: selected.number,
+                hash: selected.hash,
+            },
+            safe: Some(CheckpointMeta {
+                number: selected.number,
+                hash: selected.hash,
+            }),
+            finalized: Some(CheckpointMeta {
+                number: selected.number,
+                hash: selected.hash,
+            }),
+        };
+
+        publisher
+            .forkchoice_applied(1, Instant::now(), view)
+            .unwrap();
+
+        let fence = decode_published(&mut frame_rx);
+        let retirement = decode_published(&mut frame_rx);
+        assert!(matches!(
+            fence.event,
+            Some(envelope::Event::ForkchoiceApplied(_))
+        ));
+        let Some(envelope::Event::CandidatesRetired(retirement)) = retirement.event else {
+            panic!("expected exact finality retirement batch")
+        };
+        assert_eq!(
+            RetirementReason::try_from(retirement.reason),
+            Ok(RetirementReason::FinalizedConflict)
+        );
+        let retired: HashSet<_> = retirement.block_hashes.into_iter().collect();
+        assert_eq!(
+            retired,
+            HashSet::from([sibling.hash.to_vec(), sibling_child.hash.to_vec()])
+        );
+        assert!(publisher.candidates.contains_key(&selected.hash));
+        assert!(!publisher.candidates.contains_key(&sibling.hash));
+        assert!(!publisher.candidates.contains_key(&sibling_child.hash));
+    }
+
+    #[test]
+    fn finality_sweep_obeys_the_per_iteration_work_budget() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        for suffix in 11..=14 {
+            publisher
+                .validated(
+                    1,
+                    BlockMeta {
+                        number: 11,
+                        hash: B256::with_last_byte(suffix),
+                        parent_hash: initial.block.hash,
+                        timestamp: 11,
+                    },
+                    &[],
+                )
+                .unwrap();
+            let _ = decode_published(&mut frame_rx);
+        }
+        publisher.begin_finality_sweep(CheckpointMeta {
+            number: initial.block.number,
+            hash: initial.block.hash,
+        });
+        let before = publisher.finality_sweep.as_ref().unwrap().pending.len();
+
+        assert_eq!(publisher.process_finality_budget(1, 1).unwrap(), 1);
+        assert_eq!(
+            publisher.finality_sweep.as_ref().unwrap().pending.len(),
+            before - 1
+        );
+    }
+
+    #[test]
+    fn projection_eviction_is_explicit_and_keeps_bounded_ancestry_metadata() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        publisher.cache_limit = 2;
+        let first = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        let second = BlockMeta {
+            number: 11,
+            hash: B256::repeat_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, first, &[]).unwrap();
+        let _ = decode_published(&mut frame_rx);
+        publisher.validated(1, second, &[]).unwrap();
+        let _ = decode_published(&mut frame_rx);
+        let retirement = decode_published(&mut frame_rx);
+
+        let Some(envelope::Event::CandidatesRetired(retirement)) = retirement.event else {
+            panic!("expected cache eviction retirement")
+        };
+        assert_eq!(
+            RetirementReason::try_from(retirement.reason),
+            Ok(RetirementReason::CacheEvicted)
+        );
+        assert_eq!(retirement.block_hashes, vec![first.hash.to_vec()]);
+        assert!(publisher.candidates[&first.hash].projection.is_none());
+        assert_eq!(publisher.projection_count, 2);
+
+        // Local eviction is not consensus terminal: the same hash can be reconstructed later.
+        assert!(publisher.validated(1, first, &[]).unwrap());
+        assert!(publisher.candidates[&first.hash].projection.is_some());
+    }
+
+    #[test]
+    fn retention_expiry_is_explicit_and_consensus_rejection_is_tombstoned() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        publisher.candidate_retention = Duration::from_millis(1);
+        let candidate = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, candidate, &[]).unwrap();
+        let _ = decode_published(&mut frame_rx);
+        std::thread::sleep(Duration::from_millis(2));
+        publisher.maintain().unwrap();
+        let retirement = decode_published(&mut frame_rx);
+        assert!(matches!(
+            retirement.event,
+            Some(envelope::Event::CandidatesRetired(CandidatesRetired {
+                reason,
+                ..
+            })) if RetirementReason::try_from(reason) == Ok(RetirementReason::RetentionExpired)
+        ));
+        assert!(!publisher.candidates.contains_key(&candidate.hash));
+
+        let executed = BlockMeta {
+            hash: B256::with_last_byte(12),
+            ..candidate
+        };
+        publisher
+            .project_candidate(1, executed, &[], CandidateStage::Executed)
+            .unwrap();
+        let _ = decode_published(&mut frame_rx);
+        publisher
+            .rejected(1, executed.hash, "block_validation_failed")
+            .unwrap();
+        let _ = decode_published(&mut frame_rx);
+        assert!(publisher.tombstones.contains(&executed.hash));
+        assert!(
+            !publisher
+                .project_candidate(1, executed, &[], CandidateStage::Executed)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2192,7 +3230,14 @@ mod tests {
             CandidateStage::Validated
         );
         assert_eq!(
-            value_at(&publisher.candidates[&block.hash].projection.values, 0),
+            value_at(
+                &publisher.candidates[&block.hash]
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .values,
+                0,
+            ),
             U256::from(8)
         );
         let frame = frame_rx.try_recv().unwrap();
@@ -2302,15 +3347,17 @@ mod tests {
             )
             .unwrap();
         let deferred_hash = B256::with_last_byte(13);
-        publisher.insert_deferred_executed(
-            BlockMeta {
-                number: 13,
-                hash: deferred_hash,
-                parent_hash: child_hash,
-                timestamp: 13,
-            },
-            BlockChanges::new(),
-        );
+        publisher
+            .insert_deferred_executed(
+                BlockMeta {
+                    number: 13,
+                    hash: deferred_hash,
+                    parent_hash: child_hash,
+                    timestamp: 13,
+                },
+                BlockChanges::new(),
+            )
+            .unwrap();
 
         publisher
             .rejected(1, parent_hash, "block_validation_failed")
@@ -2424,6 +3471,35 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_requires_a_coherent_forkchoice_head() {
+        let projection = Projection {
+            block: BlockMeta {
+                number: 1,
+                hash: B256::with_last_byte(1),
+                parent_hash: B256::ZERO,
+                timestamp: 1,
+            },
+            watch_set: watch_set(),
+            values: encode_values(&[U256::ZERO]),
+            changed_bitmap: Bytes::new(),
+        };
+        let snapshot = CanonicalSnapshot {
+            forkchoice: ForkchoiceMeta {
+                head: CheckpointMeta {
+                    number: 2,
+                    hash: B256::with_last_byte(2),
+                },
+                safe: None,
+                finalized: None,
+            },
+            projection,
+            anchored_at: Instant::now(),
+        };
+
+        assert!(validate_snapshot_view(&snapshot).is_err());
+    }
+
+    #[test]
     fn projection_dictionary_rejects_a_snapshot_source_contract_violation() {
         let expected = watch_set();
         let wrong = Arc::new(WatchSet::compile(
@@ -2518,6 +3594,7 @@ mod tests {
             capabilities: CAP_FULL_PROJECTIONS | CAP_VALIDATED | CAP_CANONICAL | CAP_REJECTED,
             published: ArcSwap::from_pointee(PublishedState {
                 canonical: Arc::clone(&initial),
+                forkchoice: Some(forkchoice_for(initial.block)),
                 effective_sequence: 0,
                 recovering: false,
             }),
@@ -2569,11 +3646,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            value_at(&publisher.candidates[&first].projection.values, 0),
+            value_at(
+                &publisher.candidates[&first]
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .values,
+                0,
+            ),
             U256::from(2)
         );
         assert_eq!(
-            value_at(&publisher.candidates[&sibling].projection.values, 0),
+            value_at(
+                &publisher.candidates[&sibling]
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .values,
+                0,
+            ),
             U256::from(1)
         );
 
@@ -2687,6 +3778,7 @@ mod tests {
             capabilities: CAP_FULL_PROJECTIONS | CAP_VALIDATED | CAP_CANONICAL | CAP_REJECTED,
             published: ArcSwap::from_pointee(PublishedState {
                 canonical: Arc::clone(&initial),
+                forkchoice: Some(forkchoice_for(initial.block)),
                 effective_sequence: 0,
                 recovering: false,
             }),
@@ -2708,7 +3800,14 @@ mod tests {
         publisher.validated(1, candidate, &[]).unwrap();
 
         assert_eq!(
-            value_at(&publisher.candidates[&candidate.hash].projection.values, 0),
+            value_at(
+                &publisher.candidates[&candidate.hash]
+                    .projection
+                    .as_ref()
+                    .unwrap()
+                    .values,
+                0,
+            ),
             U256::from(7)
         );
         assert_eq!(shared.published_sequence.load(Ordering::Acquire), 1);
@@ -2739,6 +3838,7 @@ mod tests {
             capabilities: CAP_FULL_PROJECTIONS | CAP_VALIDATED | CAP_CANONICAL | CAP_REJECTED,
             published: ArcSwap::from_pointee(PublishedState {
                 canonical: Arc::clone(&initial),
+                forkchoice: Some(forkchoice_for(initial.block)),
                 effective_sequence: 0,
                 recovering: false,
             }),
@@ -2798,6 +3898,7 @@ mod tests {
             capabilities: CAP_FULL_PROJECTIONS | CAP_VALIDATED | CAP_CANONICAL | CAP_REJECTED,
             published: ArcSwap::from_pointee(PublishedState {
                 canonical: Arc::clone(&initial),
+                forkchoice: Some(forkchoice_for(initial.block)),
                 effective_sequence: 0,
                 recovering: false,
             }),
@@ -2850,6 +3951,9 @@ mod tests {
             socket_mode: 0o660,
             queue_capacity: 16,
             candidate_cache_blocks: 8,
+            candidate_metadata_entries: 64,
+            candidate_retention: Duration::from_secs(120),
+            retirement_work_budget: 16,
             consumer_buffer: 16,
             max_consumers: 4,
             max_frame_bytes: 4096,
@@ -2895,11 +3999,16 @@ mod tests {
             panic!("expected hello")
         };
         assert_eq!(hello.capabilities & CAP_EXECUTED, 0);
+        assert_ne!(hello.capabilities & CAP_FORKCHOICE_APPLIED, 0);
+        assert_ne!(hello.capabilities & CAP_CANDIDATE_RETIREMENT, 0);
         assert!(matches!(
             config.event,
             Some(envelope::Event::ConfigActivated(_))
         ));
-        assert!(matches!(snapshot.event, Some(envelope::Event::Snapshot(_))));
+        let Some(envelope::Event::Snapshot(snapshot)) = snapshot.event else {
+            panic!("expected snapshot")
+        };
+        assert!(snapshot.forkchoice.is_some());
 
         drop(client);
         service.shutdown().await;

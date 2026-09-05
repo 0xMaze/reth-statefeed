@@ -15,8 +15,8 @@ use reth::{
 };
 use reth_chain_state::ExecutedBlock;
 use reth_engine_tree::tree::{
-    CacheWaitDurations, EngineApiTreeState, EngineValidator, ExecutedBlockInfo, ExecutionObserver,
-    TreeConfig, ValidationOutcome, WaitForCaches, error::InsertPayloadError,
+    AppliedForkchoice, CacheWaitDurations, EngineApiTreeState, EngineValidator, ExecutedBlockInfo,
+    ExecutionObserver, TreeConfig, ValidationOutcome, WaitForCaches, error::InsertPayloadError,
     payload_validator::TreeCtx,
 };
 use reth_node_api::{
@@ -26,7 +26,7 @@ use reth_node_ethereum::{EthEngineTypes, EthereumEngineValidatorBuilder, Ethereu
 use reth_storage_overlay::OverlayManager;
 
 use crate::{
-    feed::{BlockMeta, FeedProducer},
+    feed::{BlockMeta, CheckpointMeta, FeedProducer, ForkchoiceMeta},
     publisher::{CanonicalSnapshot, Projection, SnapshotSource},
     watch::WatchSet,
 };
@@ -205,6 +205,22 @@ where
         self.inner.on_canonical_head_changed(hash, state);
     }
 
+    #[inline]
+    fn on_forkchoice_applied(
+        &self,
+        forkchoice: AppliedForkchoice,
+        state: &EngineApiTreeState<EthPrimitives>,
+    ) {
+        // The Reth hook resolves all hashes to numbered in-memory tree state before invoking us.
+        // This callback therefore performs only fixed-size copies plus one non-blocking enqueue.
+        self.producer.publish_forkchoice_applied(ForkchoiceMeta {
+            head: checkpoint(forkchoice.head),
+            safe: forkchoice.safe.map(checkpoint),
+            finalized: forkchoice.finalized.map(checkpoint),
+        });
+        self.inner.on_forkchoice_applied(forkchoice, state);
+    }
+
     fn payload_builder_resources(
         &self,
         parent_hash: B256,
@@ -291,6 +307,8 @@ where
     fn load_latest(&self, watch_set: Arc<WatchSet>) -> Result<CanonicalSnapshot> {
         for attempt in 1..=MAX_CANONICAL_SNAPSHOT_ATTEMPTS {
             let selected = self.provider.chain_info()?;
+            let selected_safe = self.provider.safe_block_num_hash()?;
+            let selected_finalized = self.provider.finalized_block_num_hash()?;
             let projection = match self.load_at(Arc::clone(&watch_set), selected.best_hash) {
                 Ok(projection) => projection,
                 Err(error) => {
@@ -312,10 +330,23 @@ where
             // replayed by the publisher after reload/recovery.
             let anchored_at = Instant::now();
             let confirmed = self.provider.chain_info()?;
-            if confirmed.best_hash == selected.best_hash {
+            let confirmed_safe = self.provider.safe_block_num_hash()?;
+            let confirmed_finalized = self.provider.finalized_block_num_hash()?;
+            if confirmed.best_hash == selected.best_hash
+                && confirmed_safe == selected_safe
+                && confirmed_finalized == selected_finalized
+            {
                 return Ok(CanonicalSnapshot {
                     projection,
                     anchored_at,
+                    forkchoice: ForkchoiceMeta {
+                        head: CheckpointMeta {
+                            number: selected.best_number,
+                            hash: selected.best_hash,
+                        },
+                        safe: selected_safe.map(checkpoint),
+                        finalized: selected_finalized.map(checkpoint),
+                    },
                 });
             }
 
@@ -354,5 +385,13 @@ where
             values: values.into(),
             changed_bitmap: Vec::new().into(),
         })
+    }
+}
+
+#[inline]
+const fn checkpoint(value: alloy_eips::BlockNumHash) -> CheckpointMeta {
+    CheckpointMeta {
+        number: value.number,
+        hash: value.hash,
     }
 }

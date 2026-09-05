@@ -5,6 +5,11 @@ socket = "/tmp/reth-statefeed.sock"
 socket_mode = 0o660
 queue_capacity = 8192
 candidate_cache_blocks = 128
+# Lightweight ancestry metadata outlives evicted full projections.
+candidate_metadata_entries = 1024
+candidate_retention = "2m"
+# Caps TTL/finality cleanup work in one publisher iteration.
+retirement_work_budget = 256
 consumer_buffer = 256
 max_consumers = 64
 max_frame_bytes = 4194304
