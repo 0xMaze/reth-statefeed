@@ -279,4 +279,13 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.stream.socket_mode, 0o660);
     }
+
+    #[test]
+    fn ethereum_mainnet_conversion_config_stays_parseable_and_valid() {
+        let config: Config =
+            toml::from_str(include_str!("../config.ethereum-mainnet-conversions.toml")).unwrap();
+        config.validate().unwrap();
+        assert!(config.stream.publish_executed);
+        assert_eq!(config.watch.len(), 87);
+    }
 }

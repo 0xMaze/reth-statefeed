@@ -67,6 +67,13 @@ cargo test --locked --all-targets
 
 Copy [`config.example.toml`](config.example.toml) and replace its address/slot entries. A Solidity
 mapping entry must be supplied as the final `keccak256(abi.encode(key, base_slot))` coordinate.
+The repository also includes a traced Ethereum mainnet conversion dictionary in
+[`config.ethereum-mainnet-conversions.toml`](config.ethereum-mainnet-conversions.toml); its
+deployment assumptions and edge semantics are documented in
+[`docs/ETHEREUM_MAINNET_CONVERSIONS.md`](docs/ETHEREUM_MAINNET_CONVERSIONS.md).
+The independent Foundry fork suite in [`validation/`](validation/) differentially checks deployed
+behavior, storage-read coverage, slot mutations, Aave timestamp sensitivity, and fail-closed
+upgrade guards. Its dependencies are managed with Soldeer.
 
 ```toml
 [stream]

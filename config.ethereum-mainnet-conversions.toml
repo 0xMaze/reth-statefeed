@@ -1,0 +1,473 @@
+[stream]
+# EXECUTED is intentional here: this watch set is meant for the lowest-latency local quoting path.
+publish_executed = true
+socket = "/run/reth-statefeed/statefeed.sock"
+socket_mode = 0o660
+queue_capacity = 8192
+candidate_cache_blocks = 128
+consumer_buffer = 256
+max_consumers = 64
+max_frame_bytes = 65536
+publisher_spin_us = 0
+
+# Ethereum mainnet conversion-edge watch set.
+#
+# Coordinates were verified against block 25,912,757
+# (0xfa331c6c11df54016c7c0ddf48aeb9c61e7ff07e5170da485cd858096e490b6d).
+# Values are deliberately not embedded: statefeed snapshots them from the selected chain.
+
+# -----------------------------------------------------------------------------
+# Shared token guards
+# -----------------------------------------------------------------------------
+
+[[watch]]
+id = "token.usdc.proxy.admin"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x10d6a54a4754c8869d6886b5f5d7fbfa5b4522237ea5c60d11bc4e7a1ff9390b"
+
+[[watch]]
+id = "token.usdc.proxy.implementation"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3"
+
+[[watch]]
+id = "token.usdc.paused_and_owner"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+[[watch]]
+id = "token.usdt.paused_and_owner"
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+[[watch]]
+id = "token.usdt.transfer_fee_bps"
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "token.usdt.maximum_transfer_fee"
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000004"
+
+[[watch]]
+id = "token.usdt.deprecated_and_upgraded_address"
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+slot = "0x000000000000000000000000000000000000000000000000000000000000000a"
+
+# -----------------------------------------------------------------------------
+# Sky: DAI <-> USDS and USDC <-> DAI/USDS
+# -----------------------------------------------------------------------------
+
+[[watch]]
+id = "sky.lite_psm.usdc_a.tin"
+address = "0xf6e72db5454dd049d0788e411b06cfaf16853042"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "sky.lite_psm.usdc_a.tout"
+address = "0xf6e72db5454dd049d0788e411b06cfaf16853042"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000004"
+
+[[watch]]
+id = "sky.lite_psm.usdc_a.dai_cash"
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+slot = "0x0e3d19729328f478ffc901c115f05d0195e5b68e282b84da93c6bafd953fdc80"
+
+[[watch]]
+id = "sky.lite_psm.usdc_a.pocket_balance"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x9254cb65314db3d2d7ca17f753f1d9c7f1b6fa05111d18d10ed5b9519d1b247c"
+
+[[watch]]
+id = "sky.lite_psm.usdc_a.pocket_allowance"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x33d96ce24063b8b087fa8c040c066e1b9739925a812f2a0c2202c9ef763d01be"
+
+[[watch]]
+id = "sky.dai_join.live"
+address = "0x9759a6ac90977b93b58547b4a71c78317f391a28"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "sky.usds.proxy.implementation"
+address = "0xdc035d45d973e3ec169d2276ddab16f1e407384f"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "sky.usds.auth.usds_join"
+address = "0xdc035d45d973e3ec169d2276ddab16f1e407384f"
+slot = "0x04af2650cdc358b537adffd5f648a345270bd1eff29d11e7735cd7b84ef65741"
+
+[[watch]]
+id = "sky.dai.auth.dai_join"
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+slot = "0x9fa7d1a90466effd74b6142b5e6b4b076451f75604d0878dc681cb2014f26d08"
+
+[[watch]]
+id = "sky.vat.can.dai_usds_to_dai_join"
+address = "0x35d1b3f3d7966a1dfe207aa4514c12a259a0492b"
+slot = "0x5645bd44c7a579f9907c056441d2da2f90278ada4ce1ae2cf16284a4a608c5c9"
+
+[[watch]]
+id = "sky.vat.can.dai_usds_to_usds_join"
+address = "0x35d1b3f3d7966a1dfe207aa4514c12a259a0492b"
+slot = "0x642c1ef9ff934c392343f46c239eb029ededdd3ab04b8cb7aa8cc5db70738602"
+
+# -----------------------------------------------------------------------------
+# Aave: USDC/USDT <-> static aToken <-> GHO
+# -----------------------------------------------------------------------------
+
+[[watch]]
+id = "aave.pool.proxy.implementation"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.ausdc.proxy.implementation"
+address = "0x98c23e9d8f34fefb1b7bd6a91b7ff122f4e16f5c"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.ausdc.scaled_total_supply"
+address = "0x98c23e9d8f34fefb1b7bd6a91b7ff122f4e16f5c"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000036"
+
+[[watch]]
+id = "aave.ausdt.proxy.implementation"
+address = "0x23878914efe38d27c4d67ab83ed1b93a74d4086a"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.ausdt.scaled_total_supply"
+address = "0x23878914efe38d27c4d67ab83ed1b93a74d4086a"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000036"
+
+[[watch]]
+id = "aave.waeth_usdc.proxy.implementation"
+address = "0xd4fa2d31b7968e448877f69a96de69f5de8cd23e"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.waeth_usdc.initialized_and_asset"
+address = "0xd4fa2d31b7968e448877f69a96de69f5de8cd23e"
+slot = "0x0773e532dfede91f04b12a73d3d2acd361424f41f76b4fb79f090161e36b4e00"
+
+[[watch]]
+id = "aave.waeth_usdt.proxy.implementation"
+address = "0x7bc3485026ac48b6cf9baf0a377477fff5703af8"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.waeth_usdt.initialized_and_asset"
+address = "0x7bc3485026ac48b6cf9baf0a377477fff5703af8"
+slot = "0x0773e532dfede91f04b12a73d3d2acd361424f41f76b4fb79f090161e36b4e00"
+
+# Minimal Aave Pool reserve state that affects previews and capacity. Pool.getReserveData also
+# reads variable-borrow, variable-debt-token, and MOCK_STABLE_DEBT fields, but the wrapper does not
+# consume them. Foundry mutation tests prove those reads do not alter maxDeposit.
+[[watch]]
+id = "aave.pool.usdc.configuration"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xed960c71bd5fa1333658850f076b35ec5565086b606556c3dd36a916b43ddf20"
+
+[[watch]]
+id = "aave.pool.usdc.liquidity_index_and_rate"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xed960c71bd5fa1333658850f076b35ec5565086b606556c3dd36a916b43ddf21"
+
+[[watch]]
+id = "aave.pool.usdc.deficit_and_timestamps"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xed960c71bd5fa1333658850f076b35ec5565086b606556c3dd36a916b43ddf23"
+
+[[watch]]
+id = "aave.pool.usdc.a_token_address"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xed960c71bd5fa1333658850f076b35ec5565086b606556c3dd36a916b43ddf24"
+
+[[watch]]
+id = "aave.pool.usdc.accrued_to_treasury_and_virtual_balance"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xed960c71bd5fa1333658850f076b35ec5565086b606556c3dd36a916b43ddf28"
+
+[[watch]]
+id = "aave.pool.usdt.configuration"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xca6decca4edae0c692b2b0c41376a54b812edb060282d36e07a7060ccb58244c"
+
+[[watch]]
+id = "aave.pool.usdt.liquidity_index_and_rate"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xca6decca4edae0c692b2b0c41376a54b812edb060282d36e07a7060ccb58244d"
+
+[[watch]]
+id = "aave.pool.usdt.deficit_and_timestamps"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xca6decca4edae0c692b2b0c41376a54b812edb060282d36e07a7060ccb58244f"
+
+[[watch]]
+id = "aave.pool.usdt.a_token_address"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xca6decca4edae0c692b2b0c41376a54b812edb060282d36e07a7060ccb582450"
+
+[[watch]]
+id = "aave.pool.usdt.accrued_to_treasury_and_virtual_balance"
+address = "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"
+slot = "0xca6decca4edae0c692b2b0c41376a54b812edb060282d36e07a7060ccb582454"
+
+[[watch]]
+id = "aave.gsm.waeth_usdc.proxy.implementation"
+address = "0x3a3868898305f04bec7fea77becff04c13444112"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.gsm.waeth_usdc.fee_and_flags"
+address = "0x3a3868898305f04bec7fea77becff04c13444112"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000037"
+
+[[watch]]
+id = "aave.gsm.waeth_usdc.exposure"
+address = "0x3a3868898305f04bec7fea77becff04c13444112"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000038"
+
+[[watch]]
+id = "aave.gsm.waeth_usdc.gho_reserve"
+address = "0x3a3868898305f04bec7fea77becff04c13444112"
+slot = "0x000000000000000000000000000000000000000000000000000000000000003a"
+
+[[watch]]
+id = "aave.gsm.waeth_usdt.proxy.implementation"
+address = "0x882285e62656b9623af136ce3078c6bdcc33f5e3"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.gsm.waeth_usdt.fee_and_flags"
+address = "0x882285e62656b9623af136ce3078c6bdcc33f5e3"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000037"
+
+[[watch]]
+id = "aave.gsm.waeth_usdt.exposure"
+address = "0x882285e62656b9623af136ce3078c6bdcc33f5e3"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000038"
+
+[[watch]]
+id = "aave.gsm.waeth_usdt.gho_reserve"
+address = "0x882285e62656b9623af136ce3078c6bdcc33f5e3"
+slot = "0x000000000000000000000000000000000000000000000000000000000000003a"
+
+[[watch]]
+id = "aave.gho_reserve.proxy.implementation"
+address = "0x54c58157def387a880ae62332d1445f03adbe7e9"
+slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+[[watch]]
+id = "aave.gho_reserve.waeth_usdc.usage"
+address = "0x54c58157def387a880ae62332d1445f03adbe7e9"
+slot = "0x64691f9c88e2e6b4867d44adbd591939e35af0e00a67553c81587d5f02897686"
+
+[[watch]]
+id = "aave.gho_reserve.waeth_usdt.usage"
+address = "0x54c58157def387a880ae62332d1445f03adbe7e9"
+slot = "0x2974bc752e3ee88955eca3b54fbeb8b99f22148d2fe0c02a03af5ee36a60a42d"
+
+[[watch]]
+id = "aave.gho_reserve.gho_cash"
+address = "0x40d16fc0246ad3160ccc09b8d0d3a2cd28ae6c2f"
+slot = "0xc6f51d0db80916b3d41104404231583a250620acce82873084179c5409ae58d4"
+
+# -----------------------------------------------------------------------------
+# USDD: USDT/USDC <-> USDD
+# -----------------------------------------------------------------------------
+
+[[watch]]
+id = "usdd.psm.usdt.tin"
+address = "0xce355440c00014a229bbec030a2b8f8eb45a2897"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+[[watch]]
+id = "usdd.psm.usdt.tout"
+address = "0xce355440c00014a229bbec030a2b8f8eb45a2897"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+[[watch]]
+id = "usdd.psm.usdt.sell_enabled"
+address = "0xce355440c00014a229bbec030a2b8f8eb45a2897"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "usdd.psm.usdt.buy_enabled"
+address = "0xce355440c00014a229bbec030a2b8f8eb45a2897"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000004"
+
+[[watch]]
+id = "usdd.psm.usdc.tin"
+address = "0x12d0351f68035a41d13fc8324562e2d51b7a3b93"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+[[watch]]
+id = "usdd.psm.usdc.tout"
+address = "0x12d0351f68035a41d13fc8324562e2d51b7a3b93"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+[[watch]]
+id = "usdd.psm.usdc.sell_enabled"
+address = "0x12d0351f68035a41d13fc8324562e2d51b7a3b93"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "usdd.psm.usdc.buy_enabled"
+address = "0x12d0351f68035a41d13fc8324562e2d51b7a3b93"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000004"
+
+[[watch]]
+id = "usdd.vat.debt"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000007"
+
+[[watch]]
+id = "usdd.vat.line"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000009"
+
+[[watch]]
+id = "usdd.vat.live"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x000000000000000000000000000000000000000000000000000000000000000a"
+
+# Vat.ilks(PSM-USDT-A): Art, rate, spot, line, dust.
+[[watch]]
+id = "usdd.vat.ilk.usdt.art"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xdbee49fc787bbb5ef2cb94f62237e072c673139509008b661c7749c8b2a2be7c"
+
+[[watch]]
+id = "usdd.vat.ilk.usdt.rate"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xdbee49fc787bbb5ef2cb94f62237e072c673139509008b661c7749c8b2a2be7d"
+
+[[watch]]
+id = "usdd.vat.ilk.usdt.spot"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xdbee49fc787bbb5ef2cb94f62237e072c673139509008b661c7749c8b2a2be7e"
+
+[[watch]]
+id = "usdd.vat.ilk.usdt.line"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xdbee49fc787bbb5ef2cb94f62237e072c673139509008b661c7749c8b2a2be7f"
+
+[[watch]]
+id = "usdd.vat.ilk.usdt.dust"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xdbee49fc787bbb5ef2cb94f62237e072c673139509008b661c7749c8b2a2be80"
+
+[[watch]]
+id = "usdd.vat.urn.usdt.ink"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xda2fe667f32b6978b5c3a413f1b1402fd8dcabd8d4868bcfe703355fc78fd02b"
+
+[[watch]]
+id = "usdd.vat.urn.usdt.art"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xda2fe667f32b6978b5c3a413f1b1402fd8dcabd8d4868bcfe703355fc78fd02c"
+
+# Vat.ilks(PSM-USDC-A): Art, rate, spot, line, dust.
+[[watch]]
+id = "usdd.vat.ilk.usdc.art"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xb8070b88b961bc980dd9624dc2940c55d826a6452217b7ccd403c5b1f5086b16"
+
+[[watch]]
+id = "usdd.vat.ilk.usdc.rate"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xb8070b88b961bc980dd9624dc2940c55d826a6452217b7ccd403c5b1f5086b17"
+
+[[watch]]
+id = "usdd.vat.ilk.usdc.spot"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xb8070b88b961bc980dd9624dc2940c55d826a6452217b7ccd403c5b1f5086b18"
+
+[[watch]]
+id = "usdd.vat.ilk.usdc.line"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xb8070b88b961bc980dd9624dc2940c55d826a6452217b7ccd403c5b1f5086b19"
+
+[[watch]]
+id = "usdd.vat.ilk.usdc.dust"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xb8070b88b961bc980dd9624dc2940c55d826a6452217b7ccd403c5b1f5086b1a"
+
+[[watch]]
+id = "usdd.vat.urn.usdc.ink"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x8a8627a40100b9390fa11de203ad1761d51df961a05930b9296bf308a8a94102"
+
+[[watch]]
+id = "usdd.vat.urn.usdc.art"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x8a8627a40100b9390fa11de203ad1761d51df961a05930b9296bf308a8a94103"
+
+[[watch]]
+id = "usdd.usdt_join.balance"
+address = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+slot = "0x91355112cd40c99060c242e835b171556fe0aa354e76f2edb6cde6e28bdde1dc"
+
+[[watch]]
+id = "usdd.usdc_join.balance"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+slot = "0x9fb277d7a188accde6928af0ac176a01d02a09420e3f6e486abfc29bca8ed826"
+
+[[watch]]
+id = "usdd.usdt_join.live"
+address = "0x217e42ceb2eae9ecb788fdf0e31c806c531760a3"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+[[watch]]
+id = "usdd.usdt_join.implementation_allowed"
+address = "0x217e42ceb2eae9ecb788fdf0e31c806c531760a3"
+slot = "0xac33ff75c19e70fe83507db0d683fd3465c996598dc972688b7ace676c89077b"
+
+[[watch]]
+id = "usdd.usdt_join.auth.psm"
+address = "0x217e42ceb2eae9ecb788fdf0e31c806c531760a3"
+slot = "0x29f0f2386bad349d8c1b7db6ea6a61a12a051bb07ee01857a783f3664a0ac4f8"
+
+[[watch]]
+id = "usdd.usdc_join.live"
+address = "0x9a7e1b324060db7342aea08c0dc56f55ced6f519"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+[[watch]]
+id = "usdd.usdc_join.auth.psm"
+address = "0x9a7e1b324060db7342aea08c0dc56f55ced6f519"
+slot = "0x6215b71d60704c60a62d58108d70b1ba183d54a2523e2911360adea7e13bbcc0"
+
+[[watch]]
+id = "usdd.vat.auth.usdt_join"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x20be428358724a8084b06c39253eebd7467250bbb72a3ffba80d7059bc4c95c5"
+
+[[watch]]
+id = "usdd.vat.auth.usdc_join"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xd34684d8853c62c7beac1a22018df37a2f18ac0aeecbe720f7abfda04829b9a6"
+
+[[watch]]
+id = "usdd.usdd_join.live"
+address = "0x983dfef6d71862d809e239845da5a959492f63b8"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000003"
+
+[[watch]]
+id = "usdd.token.auth.usdd_join"
+address = "0x4f8e5de400de08b164e7421b3ee387f461becd1a"
+slot = "0xc62c3fd51ec10be331652d20b6b81b68224ba4053bf5a14881aa727d58309fec"
+
+[[watch]]
+id = "usdd.vat.can.usdt_psm_to_usdd_join"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0x454168415e0f4239aec154bdf3fc07431f5caf5d20fbf6c58be580add8083bc1"
+
+[[watch]]
+id = "usdd.vat.can.usdc_psm_to_usdd_join"
+address = "0xff77f6209239deb2c076179499f2346b0032097f"
+slot = "0xa3b4757d5d6cfd6c026b34e1f4843418197ec4fcb406abe2127848bc2273c868"
