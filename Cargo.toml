@@ -1,0 +1,73 @@
+[package]
+name = "reth-statefeed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+alloy-network = "2.4.1"
+alloy-primitives = { version = "1.7.2", features = ["serde"] }
+arc-swap = "1.8"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+core_affinity = "0.8"
+crossbeam-channel = "0.5"
+eyre = "0.6"
+metrics = "0.24"
+notify = "8"
+prost = "0.14"
+reth = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e", default-features = false }
+reth-chain-state = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth-cli-util = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth-db = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e", features = ["mdbx"] }
+reth-engine-tree = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth-node-api = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth-node-ethereum = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+reth-storage-overlay = { git = "https://github.com/0xMaze/reth", rev = "6d512bdb2bdb442228201c7bb7765009bcd8299e" }
+serde = { version = "1", features = ["derive"] }
+smallvec = "1.15"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[features]
+default = [
+    "asm-keccak",
+    "jemalloc",
+    "keccak-cache-global",
+    "min-trace-logs",
+    "otlp",
+    "otlp-logs",
+]
+asm-keccak = ["reth/asm-keccak"]
+jemalloc = ["reth/jemalloc"]
+jit = ["reth/jit"]
+keccak-cache-global = ["reth/keccak-cache-global"]
+min-trace-logs = ["reth/min-trace-logs"]
+otlp = ["reth/otlp"]
+otlp-logs = ["reth/otlp-logs"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "symbols"
+panic = "unwind"
+codegen-units = 16
+
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

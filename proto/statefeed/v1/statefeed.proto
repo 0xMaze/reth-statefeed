@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package statefeed.v1;
+
+// Every server-to-consumer payload is framed by a four-byte big-endian length prefix.
+message Envelope {
+  uint32 protocol_version = 1;
+  bytes boot_id = 2; // exactly 16 bytes
+  uint64 sequence = 3;
+  uint64 config_generation = 4;
+  uint64 emitted_at_monotonic_ns = 5;
+
+  oneof event {
+    Hello hello = 10;
+    ConfigActivated config_activated = 11;
+    Snapshot snapshot = 12;
+    BlockState block_state = 13;
+    BlockValidated block_validated = 14;
+    BlockRejected block_rejected = 15;
+    CanonicalHead canonical_head = 16;
+    Gap gap = 17;
+  }
+}
+
+message Hello {
+  string service_version = 1;
+  uint64 chain_id = 2;
+  bytes genesis_hash = 3; // exactly 32 bytes
+  uint64 capabilities = 4;
+}
+
+message ConfigActivated {
+  repeated WatchKey keys = 1;
+}
+
+message WatchKey {
+  uint32 key_id = 1;
+  string id = 2;
+  bytes address = 3; // exactly 20 bytes
+  bytes slot = 4; // exactly 32 bytes
+}
+
+message BlockRef {
+  uint64 number = 1;
+  bytes hash = 2; // exactly 32 bytes
+  bytes parent_hash = 3; // exactly 32 bytes
+  uint64 timestamp = 4;
+}
+
+message Snapshot {
+  BlockRef block = 1;
+  // Big-endian values packed in key_id order. Value i is values[i*32:(i+1)*32].
+  bytes values = 2;
+}
+
+enum BlockStage {
+  BLOCK_STAGE_UNSPECIFIED = 0;
+  BLOCK_STAGE_EXECUTED = 1;
+  BLOCK_STAGE_VALIDATED = 2;
+}
+
+message BlockState {
+  BlockStage stage = 1;
+  BlockRef block = 2;
+  // Big-endian values packed in key_id order. Value i is values[i*32:(i+1)*32].
+  bytes values = 3;
+  // Little-endian within each byte: bit i marks key_id i as changed in this block.
+  bytes changed_bitmap = 4;
+}
+
+message BlockValidated {
+  bytes block_hash = 1;
+}
+
+message BlockRejected {
+  bytes block_hash = 1;
+  string reason = 2;
+}
+
+message CanonicalHead {
+  reserved 1; // canonical hash is BlockRef.hash; do not duplicate it
+  bytes previous_block_hash = 2;
+  BlockRef block = 3;
+  bytes values = 4;
+  // Values changed from previous_block_hash, including across reorgs.
+  bytes changed_bitmap = 5;
+}
+
+message Gap {
+  uint64 last_contiguous_sequence = 1;
+  string reason = 2;
+}

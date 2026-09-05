@@ -1,0 +1,18 @@
+[stream]
+# Startup-only rollout switch. EXECUTED is speculative until a matching VALIDATED event arrives.
+publish_executed = false
+socket = "/tmp/reth-statefeed.sock"
+socket_mode = 0o660
+queue_capacity = 8192
+candidate_cache_blocks = 128
+consumer_buffer = 256
+max_consumers = 64
+max_frame_bytes = 4194304
+# Optional latency tuning. Pin only to a CPU reserved for the publisher.
+# publisher_cpu = 3
+publisher_spin_us = 0
+
+[[watch]]
+id = "example.value"
+address = "0x0000000000000000000000000000000000000000"
+slot = "0x0000000000000000000000000000000000000000000000000000000000000000"
