@@ -166,16 +166,16 @@ pub struct CheckpointRef {
     pub hash: Vec<u8>,
 }
 
-/// Head, safe, and finalized checkpoints selected by one applied forkchoice update.
+/// Coherent head, safe, and finalized checkpoints after one applied forkchoice update.
 #[derive(Clone, PartialEq, Message)]
 pub struct ForkchoiceView {
     /// Selected canonical head.
     #[prost(message, optional, tag = "1")]
     pub head: Option<CheckpointRef>,
-    /// Selected safe checkpoint, absent when the Engine API hash was zero.
+    /// Effective safe checkpoint coherent with `head`, if Reth has one.
     #[prost(message, optional, tag = "2")]
     pub safe: Option<CheckpointRef>,
-    /// Selected finalized checkpoint, absent when the Engine API hash was zero.
+    /// Effective finalized checkpoint coherent with `head`, if Reth has one.
     #[prost(message, optional, tag = "3")]
     pub finalized: Option<CheckpointRef>,
 }

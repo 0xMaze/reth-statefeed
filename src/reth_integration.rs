@@ -1,6 +1,13 @@
 //! Reth 2.5.2 integration: validator decoration and anchored snapshot reads.
 
-use std::{fmt, sync::Arc, time::Instant};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use alloy_primitives::B256;
 use eyre::{Result, eyre};
@@ -26,7 +33,7 @@ use reth_node_ethereum::{EthEngineTypes, EthereumEngineValidatorBuilder, Ethereu
 use reth_storage_overlay::OverlayManager;
 
 use crate::{
-    feed::{BlockMeta, CheckpointMeta, FeedProducer, ForkchoiceMeta},
+    feed::{AppliedForkchoiceMeta, BlockMeta, CheckpointMeta, FeedProducer, ForkchoiceMeta},
     publisher::{CanonicalSnapshot, Projection, SnapshotSource},
     watch::WatchSet,
 };
@@ -39,20 +46,81 @@ type EthPayloadAttributes = <EthEngineTypes as PayloadTypes>::PayloadAttributes;
 /// Prevents a continuously advancing head from monopolizing a snapshot worker.
 const MAX_CANONICAL_SNAPSHOT_ATTEMPTS: usize = 4;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TrackedForkchoice {
+    revision: u64,
+    view: Option<AppliedForkchoiceMeta>,
+}
+
+#[derive(Debug)]
+struct AppliedForkchoiceTrackerInner {
+    next_revision: AtomicU64,
+    latest: arc_swap::ArcSwap<TrackedForkchoice>,
+}
+
+/// Lock-free handoff of the latest applied Engine API view to snapshot workers.
+///
+/// The engine tree is the sole writer. Readers use the embedded revision to reject a provider
+/// snapshot if forkchoice changed while storage was being read. Updating this tracker before the
+/// lossy event queue also makes overflow recovery converge directly to the newest applied view.
+#[derive(Clone, Debug)]
+pub struct AppliedForkchoiceTracker {
+    inner: Arc<AppliedForkchoiceTrackerInner>,
+}
+
+impl Default for AppliedForkchoiceTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(AppliedForkchoiceTrackerInner {
+                next_revision: AtomicU64::new(0),
+                latest: arc_swap::ArcSwap::from_pointee(TrackedForkchoice::default()),
+            }),
+        }
+    }
+}
+
+impl AppliedForkchoiceTracker {
+    #[inline]
+    fn update(&self, view: Option<AppliedForkchoiceMeta>) {
+        // Engine tree lifecycle callbacks are serialized by its event loop, so stores cannot
+        // overtake one another. The revision is still atomic to make the shared-memory boundary
+        // explicit and keep reads entirely lock-free.
+        let revision = self
+            .inner
+            .next_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.inner
+            .latest
+            .store(Arc::new(TrackedForkchoice { revision, view }));
+    }
+
+    #[inline]
+    fn load(&self) -> Arc<TrackedForkchoice> {
+        self.inner.latest.load_full()
+    }
+}
+
 /// Builds the stock Ethereum engine validator and decorates it with statefeed publication.
 #[derive(Clone)]
 pub struct StatefeedEngineValidatorBuilder {
     inner: BasicEngineValidatorBuilder<EthereumEngineValidatorBuilder>,
     producer: FeedProducer,
+    forkchoice_tracker: AppliedForkchoiceTracker,
     publish_executed: bool,
 }
 
 impl StatefeedEngineValidatorBuilder {
     /// Creates a builder around Reth's stock validator implementation.
-    pub fn new(producer: FeedProducer, publish_executed: bool) -> Self {
+    pub fn new(
+        producer: FeedProducer,
+        forkchoice_tracker: AppliedForkchoiceTracker,
+        publish_executed: bool,
+    ) -> Self {
         Self {
             inner: BasicEngineValidatorBuilder::default(),
             producer,
+            forkchoice_tracker,
             publish_executed,
         }
     }
@@ -88,6 +156,7 @@ where
         let Self {
             inner,
             producer,
+            forkchoice_tracker,
             publish_executed,
         } = self;
         let mut validator = inner
@@ -101,6 +170,7 @@ where
         Ok(StatefeedEngineValidator {
             inner: validator,
             producer,
+            forkchoice_tracker,
             publish_executed,
         })
     }
@@ -135,6 +205,7 @@ impl ExecutionObserver<EthPrimitives> for StatefeedExecutionObserver {
 pub struct StatefeedEngineValidator<V> {
     inner: V,
     producer: FeedProducer,
+    forkchoice_tracker: AppliedForkchoiceTracker,
     publish_executed: bool,
 }
 
@@ -198,11 +269,24 @@ where
     }
 
     fn on_canonical_head_changed(&self, hash: B256, state: &EngineApiTreeState<EthPrimitives>) {
-        // Tree state already reflects the new head. Publish before delegating because the stock
-        // hook may start txpool prewarming and is unrelated to statefeed correctness.
-        self.producer
-            .publish_canonical(state.tree_state().canonical_block_number(), hash);
+        // This raw lifecycle hook also fires during internal tree transitions and before every
+        // FCU field has necessarily been accepted. External canonical publication is driven by
+        // the stronger `on_forkchoice_applied` hook below.
         self.inner.on_canonical_head_changed(hash, state);
+    }
+
+    #[inline]
+    fn on_canonical_state_reset(
+        &self,
+        head: alloy_eips::BlockNumHash,
+        state: &EngineApiTreeState<EthPrimitives>,
+    ) {
+        // Invalidate the reconnect anchor before entering the lossy queue. Recovery can then read
+        // the provider's post-reset state even if this notification itself is dropped.
+        self.forkchoice_tracker.update(None);
+        self.producer
+            .publish_canonical_state_reset(checkpoint(head));
+        self.inner.on_canonical_state_reset(head, state);
     }
 
     #[inline]
@@ -211,13 +295,15 @@ where
         forkchoice: AppliedForkchoice,
         state: &EngineApiTreeState<EthPrimitives>,
     ) {
-        // The Reth hook resolves all hashes to numbered in-memory tree state before invoking us.
-        // This callback therefore performs only fixed-size copies plus one non-blocking enqueue.
-        self.producer.publish_forkchoice_applied(ForkchoiceMeta {
-            head: checkpoint(forkchoice.head),
+        let view = AppliedForkchoiceMeta {
+            head_hash: forkchoice.head,
             safe: forkchoice.safe.map(checkpoint),
             finalized: forkchoice.finalized.map(checkpoint),
-        });
+        };
+        // The tracker must lead the lossy queue: any overflow snapshot is then at least as recent
+        // as the event which failed to enqueue. Both operations are constant-size and non-blocking.
+        self.forkchoice_tracker.update(Some(view));
+        self.producer.publish_forkchoice_applied(view);
         self.inner.on_forkchoice_applied(forkchoice, state);
     }
 
@@ -291,12 +377,16 @@ where
 #[derive(Clone, Debug)]
 pub struct RethSnapshotSource<P> {
     provider: P,
+    forkchoice_tracker: AppliedForkchoiceTracker,
 }
 
 impl<P> RethSnapshotSource<P> {
     /// Wraps the full node provider exposed after launch.
-    pub const fn new(provider: P) -> Self {
-        Self { provider }
+    pub const fn new(provider: P, forkchoice_tracker: AppliedForkchoiceTracker) -> Self {
+        Self {
+            provider,
+            forkchoice_tracker,
+        }
     }
 }
 
@@ -306,6 +396,45 @@ where
 {
     fn load_latest(&self, watch_set: Arc<WatchSet>) -> Result<CanonicalSnapshot> {
         for attempt in 1..=MAX_CANONICAL_SNAPSHOT_ATTEMPTS {
+            let tracked = self.forkchoice_tracker.load();
+            if let Some(view) = tracked.view {
+                let projection = match self.load_at(Arc::clone(&watch_set), view.head_hash) {
+                    Ok(projection) => projection,
+                    Err(error) => {
+                        let confirmed = self.forkchoice_tracker.load();
+                        if confirmed.revision != tracked.revision
+                            && attempt < MAX_CANONICAL_SNAPSHOT_ATTEMPTS
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+
+                // Timestamp before confirming the tracker revision. An event observed no later
+                // than this is represented by the projection; a later event is replayed.
+                let anchored_at = Instant::now();
+                let confirmed = self.forkchoice_tracker.load();
+                if confirmed.revision == tracked.revision {
+                    return Ok(CanonicalSnapshot {
+                        forkchoice: view.resolve(projection.block.number),
+                        projection,
+                        anchored_at,
+                    });
+                }
+
+                if attempt == MAX_CANONICAL_SNAPSHOT_ATTEMPTS {
+                    return Err(eyre!(
+                        "forkchoice kept changing while reading statefeed snapshot (revision {} -> {})",
+                        tracked.revision,
+                        confirmed.revision
+                    ));
+                }
+                continue;
+            }
+
+            // Bootstrap and explicit backfill resets have no applied FCU anchor. In that case the
+            // provider's physical canonical state is authoritative until a new FCU is observed.
             let selected = self.provider.chain_info()?;
             let selected_safe = self.provider.safe_block_num_hash()?;
             let selected_finalized = self.provider.finalized_block_num_hash()?;
@@ -313,10 +442,12 @@ where
                 Ok(projection) => projection,
                 Err(error) => {
                     // A reorg can make the selected hash unavailable to BlockchainProvider while
-                    // the projection is being read. Retry only when the canonical head confirms
-                    // that this was a race; errors at a stable head remain actionable.
+                    // the projection is being read. Retry only when the canonical head or applied
+                    // forkchoice revision confirms a race; stable-anchor errors remain actionable.
+                    let confirmed_tracked = self.forkchoice_tracker.load();
                     let confirmed = self.provider.chain_info()?;
-                    if confirmed.best_hash != selected.best_hash
+                    if (confirmed_tracked.revision != tracked.revision
+                        || confirmed.best_hash != selected.best_hash)
                         && attempt < MAX_CANONICAL_SNAPSHOT_ATTEMPTS
                     {
                         continue;
@@ -329,10 +460,13 @@ where
             // instant is covered by the confirmed head; later callbacks are conservatively
             // replayed by the publisher after reload/recovery.
             let anchored_at = Instant::now();
+            let confirmed_tracked = self.forkchoice_tracker.load();
             let confirmed = self.provider.chain_info()?;
             let confirmed_safe = self.provider.safe_block_num_hash()?;
             let confirmed_finalized = self.provider.finalized_block_num_hash()?;
-            if confirmed.best_hash == selected.best_hash
+            if confirmed_tracked.revision == tracked.revision
+                && confirmed_tracked.view.is_none()
+                && confirmed.best_hash == selected.best_hash
                 && confirmed_safe == selected_safe
                 && confirmed_finalized == selected_finalized
             {
@@ -351,6 +485,13 @@ where
             }
 
             if attempt == MAX_CANONICAL_SNAPSHOT_ATTEMPTS {
+                if confirmed_tracked.revision != tracked.revision {
+                    return Err(eyre!(
+                        "forkchoice kept changing while reading statefeed snapshot (revision {} -> {})",
+                        tracked.revision,
+                        confirmed_tracked.revision
+                    ));
+                }
                 return Err(eyre!(
                     "canonical head kept changing while reading statefeed snapshot (last attempted {}, now {})",
                     selected.best_hash,
@@ -393,5 +534,64 @@ const fn checkpoint(value: alloy_eips::BlockNumHash) -> CheckpointMeta {
     CheckpointMeta {
         number: value.number,
         hash: value.hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied(head: u8) -> AppliedForkchoiceMeta {
+        AppliedForkchoiceMeta {
+            head_hash: B256::with_last_byte(head),
+            safe: None,
+            finalized: None,
+        }
+    }
+
+    #[test]
+    fn tracker_revisions_every_applied_forkchoice_and_reset() {
+        let tracker = AppliedForkchoiceTracker::default();
+        let initial = tracker.load();
+        assert_eq!(*initial, TrackedForkchoice::default());
+
+        let view = applied(1);
+        tracker.update(Some(view));
+        let first = tracker.load();
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.view, Some(view));
+
+        // Reaffirmations are ordering fences too and must invalidate an in-flight snapshot.
+        tracker.update(Some(view));
+        let reaffirmed = tracker.load();
+        assert_eq!(reaffirmed.revision, 2);
+        assert_eq!(reaffirmed.view, Some(view));
+
+        tracker.update(None);
+        let reset = tracker.load();
+        assert_eq!(reset.revision, 3);
+        assert_eq!(reset.view, None);
+    }
+
+    #[test]
+    fn ancestor_view_omits_retained_checkpoints_ahead_of_head() {
+        let head_number = 10;
+        let finalized = CheckpointMeta {
+            number: 9,
+            hash: B256::with_last_byte(9),
+        };
+        let resolved = AppliedForkchoiceMeta {
+            head_hash: B256::with_last_byte(10),
+            safe: Some(CheckpointMeta {
+                number: 12,
+                hash: B256::with_last_byte(12),
+            }),
+            finalized: Some(finalized),
+        }
+        .resolve(head_number);
+
+        assert_eq!(resolved.head.number, head_number);
+        assert_eq!(resolved.safe, None);
+        assert_eq!(resolved.finalized, Some(finalized));
     }
 }

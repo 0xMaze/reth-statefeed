@@ -33,7 +33,10 @@ use uuid::Uuid;
 
 use crate::{
     config::{Config, StreamConfig},
-    feed::{ActivationRequest, BlockMeta, CheckpointMeta, FeedEvent, FeedProducer, ForkchoiceMeta},
+    feed::{
+        ActivationRequest, AppliedForkchoiceMeta, BlockMeta, CheckpointMeta, ControlEvent,
+        FeedEvent, FeedProducer, ForkchoiceMeta,
+    },
     watch::{BlockChanges, WatchSet},
     wire::{
         self, BlockRef, BlockRejected, BlockStage, BlockState, BlockValidated,
@@ -545,6 +548,7 @@ fn run_publisher(thread: PublisherThread) {
         candidate_policy,
     );
     let loss_notifications = publisher.producer.loss_notifications();
+    let control_events = publisher.producer.take_control_events();
     let maintenance_interval = candidate_policy
         .retention
         .checked_div(4)
@@ -562,64 +566,92 @@ fn run_publisher(thread: PublisherThread) {
         if maintenance.try_recv().is_ok() && !run_maintenance(&mut publisher, &shutdown) {
             break;
         }
-        let event = match receiver.try_recv() {
-            Ok(event) => event,
+        let event = match control_events.try_recv() {
+            Ok(event) => PublisherEvent::Control(event),
             Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {
-                let spin_started = Instant::now();
-                let mut event = None;
-                let mut loss_wakeup = false;
-                while spin_started.elapsed() < spin_duration {
-                    if shutdown_requested(&shutdown) {
-                        return;
-                    }
-                    if loss_notifications.try_recv().is_ok() {
-                        loss_wakeup = true;
-                        break;
-                    }
-                    match receiver.try_recv() {
-                        Ok(received) => {
-                            event = Some(received);
+            Err(TryRecvError::Empty) => match receiver.try_recv() {
+                Ok(event) => PublisherEvent::Data(event),
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    let spin_started = Instant::now();
+                    let mut event = None;
+                    let mut loss_wakeup = false;
+                    while spin_started.elapsed() < spin_duration {
+                        if shutdown_requested(&shutdown) {
+                            return;
+                        }
+                        if loss_notifications.try_recv().is_ok() {
+                            loss_wakeup = true;
                             break;
                         }
-                        Err(TryRecvError::Disconnected) => return,
-                        Err(TryRecvError::Empty) => std::hint::spin_loop(),
-                    }
-                }
-                if loss_wakeup {
-                    continue;
-                }
-
-                match event {
-                    Some(event) => event,
-                    None => crossbeam_channel::select! {
-                        recv(shutdown) -> _ => break,
-                        recv(loss_notifications) -> _ => continue,
-                        recv(maintenance) -> _ => {
-                            if !run_maintenance(&mut publisher, &shutdown) {
+                        match control_events.try_recv() {
+                            Ok(received) => {
+                                event = Some(PublisherEvent::Control(received));
                                 break;
                             }
-                            continue;
+                            Err(TryRecvError::Disconnected) => return,
+                            Err(TryRecvError::Empty) => {}
+                        }
+                        match receiver.try_recv() {
+                            Ok(received) => {
+                                event = Some(PublisherEvent::Data(received));
+                                break;
+                            }
+                            Err(TryRecvError::Disconnected) => return,
+                            Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                        }
+                    }
+                    if loss_wakeup {
+                        continue;
+                    }
+
+                    match event {
+                        Some(event) => event,
+                        None => crossbeam_channel::select! {
+                            recv(shutdown) -> _ => break,
+                            recv(loss_notifications) -> _ => continue,
+                            recv(maintenance) -> _ => {
+                                if !run_maintenance(&mut publisher, &shutdown) {
+                                    break;
+                                }
+                                continue;
+                            },
+                            recv(control_events) -> event => match event {
+                                Ok(event) => PublisherEvent::Control(event),
+                                Err(_) => break,
+                            },
+                            recv(receiver) -> event => match event {
+                                Ok(event) => PublisherEvent::Data(event),
+                                Err(_) => break,
+                            },
                         },
-                        recv(receiver) -> event => match event {
-                            Ok(event) => event,
-                            Err(_) => break,
-                        },
-                    },
+                    }
                 }
-            }
+            },
         };
 
         if !recover_pending_loss(&mut publisher, &shutdown) {
             break;
         }
-        if let Err(error) = publisher.handle(event) {
+        let result = match event {
+            PublisherEvent::Data(event) => publisher.handle(event),
+            PublisherEvent::Control(event) => publisher.handle_control(event),
+        };
+        if let Err(error) = result {
             error!(target: "statefeed", %error, "failed to publish statefeed event");
             if !publisher.recover_until_success("publisher_error", &shutdown) {
                 break;
             }
         }
     }
+}
+
+// Boxing `FeedEvent` here would add an allocation to every publisher dequeue merely to shrink a
+// short-lived stack discriminant. The publisher thread already reserves space for the same event.
+#[allow(clippy::large_enum_variant)]
+enum PublisherEvent {
+    Data(FeedEvent),
+    Control(ControlEvent),
 }
 
 fn run_maintenance(publisher: &mut Publisher, shutdown: &Receiver<()>) -> bool {
@@ -703,6 +735,23 @@ struct DeferredExecuted {
 struct FinalitySweep {
     checkpoint: CheckpointMeta,
     pending: VecDeque<(u64, B256)>,
+    classifications: HashMap<B256, FinalityClassification>,
+    active: Option<FinalityWalk>,
+}
+
+#[derive(Debug)]
+struct FinalityWalk {
+    incarnation: u64,
+    root: B256,
+    current: B256,
+    path: SmallVec<[B256; 8]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalityClassification {
+    Compatible,
+    Conflict,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -865,20 +914,29 @@ impl Publisher {
                 }
                 Ok(())
             }
-            FeedEvent::Canonical {
+            FeedEvent::CanonicalStateReset {
                 observed_at,
                 generation,
-                block_number,
-                block_hash,
+                head,
             } => {
-                let published =
-                    self.canonical(generation, observed_at, block_number, block_hash)?;
-                if published {
-                    self.shared
-                        .metrics
-                        .canonical_end_to_end
-                        .record(observed_at.elapsed().as_secs_f64());
+                let active_generation = self
+                    .shared
+                    .published
+                    .load()
+                    .canonical
+                    .watch_set
+                    .generation();
+                if generation > active_generation {
+                    return Err(eyre!(
+                        "received canonical reset generation {generation} before active generation {active_generation}"
+                    ));
                 }
+                if observed_at <= self.snapshot_anchored_at {
+                    return Ok(());
+                }
+                debug!(target: "statefeed", number = head.number, hash = %head.hash, "re-anchoring after canonical state reset");
+                self.announce_gap("canonical_state_reset")?;
+                self.reanchor()?;
                 Ok(())
             }
             FeedEvent::ForkchoiceApplied {
@@ -910,7 +968,12 @@ impl Publisher {
                 }
                 Ok(())
             }
-            FeedEvent::ActivateConfig { watch_set, ack } => {
+        }
+    }
+
+    fn handle_control(&mut self, event: ControlEvent) -> Result<()> {
+        match event {
+            ControlEvent::ActivateConfig { watch_set, ack } => {
                 let activated = match self.activate(watch_set) {
                     Ok(()) => true,
                     Err(error) => {
@@ -1271,7 +1334,7 @@ impl Publisher {
         &mut self,
         generation: u64,
         observed_at: Instant,
-        block_number: u64,
+        expected_block_number: Option<u64>,
         block_hash: B256,
     ) -> Result<bool> {
         let active_generation = self
@@ -1325,9 +1388,12 @@ impl Publisher {
             projection
         };
         validate_projection_dictionary(&projection, &previous_projection.watch_set)?;
-        if projection.block.hash != block_hash || projection.block.number != block_number {
+        if projection.block.hash != block_hash
+            || expected_block_number.is_some_and(|number| projection.block.number != number)
+        {
             return Err(eyre!(
-                "canonical projection identity mismatch: callback {block_number}/{block_hash}, projection {}/{}",
+                "canonical projection identity mismatch: callback {:?}/{block_hash}, projection {}/{}",
+                expected_block_number,
                 projection.block.number,
                 projection.block.hash
             ));
@@ -1336,8 +1402,11 @@ impl Publisher {
         let changed_bitmap = canonical_changed_bitmap(&previous_projection, &projection)?;
 
         let previous = self.canonical_hash;
-        self.canonical_hash = block_hash;
-        self.schedule_expiry(previous);
+        // Keep the last *published* canonical head protected while inserting a reconstructed
+        // projection. Cache enforcement can publish retirement events, and retiring `previous`
+        // before consumers receive CanonicalHead(previous -> block_hash) would violate stream
+        // ordering. The newly inserted projection is the newest eviction candidate, so protecting
+        // `previous` is sufficient until the canonical frame is committed below.
         self.insert_candidate(projection.clone(), CandidateStage::Validated, true, 0)?;
         let sequence = self.shared.publish_state(
             projection.watch_set.generation(),
@@ -1351,11 +1420,17 @@ impl Publisher {
             None,
             false,
         )?;
+        self.canonical_hash = block_hash;
+        self.schedule_expiry(previous);
         if let Some(candidate) = self.candidates.get_mut(&block_hash)
             && candidate.first_sequence == 0
         {
             candidate.first_sequence = sequence;
         }
+        self.shared
+            .metrics
+            .canonical_end_to_end
+            .record(observed_at.elapsed().as_secs_f64());
         Ok(true)
     }
 
@@ -1363,9 +1438,8 @@ impl Publisher {
         &mut self,
         generation: u64,
         observed_at: Instant,
-        view: ForkchoiceMeta,
+        applied: AppliedForkchoiceMeta,
     ) -> Result<bool> {
-        validate_forkchoice_checkpoints(view)?;
         let published = self.shared.published.load();
         let active_generation = published.canonical.watch_set.generation();
         drop(published);
@@ -1378,19 +1452,16 @@ impl Publisher {
             return Ok(false);
         }
 
-        // Normally CanonicalHead was queued immediately before this event by the same engine
-        // thread. Recover by hash if a future Reth call path emits only the applied-FCU hook.
-        if self.canonical_hash != view.head.hash {
-            self.canonical(generation, observed_at, view.head.number, view.head.hash)?;
+        // `ForkchoiceApplied` is the sole externally visible source of canonical truth. Resolve
+        // the numbered projection here, outside the Engine API hot path.
+        if self.canonical_hash != applied.head_hash {
+            self.canonical(generation, observed_at, None, applied.head_hash)?;
         }
         let published = self.shared.published.load();
-        if published.canonical.block.hash != view.head.hash
-            || published.canonical.block.number != view.head.number
-        {
+        if published.canonical.block.hash != applied.head_hash {
             return Err(eyre!(
-                "applied forkchoice head {}/{} does not match canonical projection {}/{}",
-                view.head.number,
-                view.head.hash,
+                "applied forkchoice head {} does not match canonical projection {}/{}",
+                applied.head_hash,
                 published.canonical.block.number,
                 published.canonical.block.hash
             ));
@@ -1398,6 +1469,8 @@ impl Publisher {
         let projection = Arc::clone(&published.canonical);
         let active_generation = projection.watch_set.generation();
         drop(published);
+        let view = applied.resolve(projection.block.number);
+        validate_forkchoice_checkpoints(view)?;
 
         // Never deduplicate this event: its sequence is the consumer's forkchoice view id even
         // when head, safe, and finalized all reaffirm the previous values.
@@ -1411,14 +1484,14 @@ impl Publisher {
             false,
         )?;
 
-        if view.finalized != self.last_finalized {
-            self.last_finalized = view.finalized;
-            if let Some(finalized) = view.finalized {
-                self.begin_finality_sweep(finalized);
-                self.process_finality_budget(active_generation, self.retirement_work_budget)?;
-            } else {
-                self.finality_sweep = None;
-            }
+        // The Reth hook reports the effective finalized checkpoint, including a retained value
+        // when the FCU supplied zero. `None` therefore means no coherent checkpoint is known.
+        if let Some(finalized) = view.finalized
+            && Some(finalized) != self.last_finalized
+        {
+            self.last_finalized = Some(finalized);
+            self.begin_finality_sweep(finalized);
+            self.process_finality_budget(active_generation, self.retirement_work_budget)?;
         }
         Ok(true)
     }
@@ -1645,9 +1718,14 @@ impl Publisher {
     }
 
     fn begin_finality_sweep(&mut self, checkpoint: CheckpointMeta) {
+        let pending: VecDeque<_> = self.metadata_order.iter().copied().collect();
+        let mut classifications = HashMap::default();
+        classifications.reserve(pending.len());
         self.finality_sweep = Some(FinalitySweep {
             checkpoint,
-            pending: self.metadata_order.iter().copied().collect(),
+            pending,
+            classifications,
+            active: None,
         });
     }
 
@@ -1658,6 +1736,8 @@ impl Publisher {
             self.finality_sweep = Some(FinalitySweep {
                 checkpoint,
                 pending: VecDeque::from([(incarnation, hash)]),
+                classifications: HashMap::default(),
+                active: None,
             });
         }
         if self
@@ -1677,69 +1757,105 @@ impl Publisher {
     }
 
     fn process_finality_budget(&mut self, generation: u64, budget: usize) -> Result<usize> {
+        let Some(mut sweep) = self.finality_sweep.take() else {
+            return Ok(0);
+        };
         let mut work = 0;
         let mut retired = Vec::new();
         while work < budget {
-            let Some((checkpoint, incarnation, hash)) =
-                self.finality_sweep.as_mut().and_then(|sweep| {
-                    sweep
-                        .pending
-                        .pop_front()
-                        .map(|(incarnation, hash)| (sweep.checkpoint, incarnation, hash))
-                })
-            else {
-                self.finality_sweep = None;
-                break;
+            let mut walk = if let Some(walk) = sweep.active.take() {
+                walk
+            } else {
+                let Some((incarnation, hash)) = sweep.pending.pop_front() else {
+                    break;
+                };
+                if self.current_incarnation(hash) != Some(incarnation)
+                    || hash == self.canonical_hash
+                {
+                    work += 1;
+                    continue;
+                }
+                FinalityWalk {
+                    incarnation,
+                    root: hash,
+                    current: hash,
+                    path: SmallVec::new(),
+                }
             };
+
+            // One budget unit performs at most one metadata lookup or follows one ancestry edge.
+            // Memoized path compression makes total classification work linear in cached metadata
+            // instead of rescanning a deep shared ancestry for every candidate.
             work += 1;
-            let current_incarnation = self.current_incarnation(hash);
-            if current_incarnation == Some(incarnation)
-                && hash != self.canonical_hash
-                && self.conflicts_with_finalized(hash, checkpoint)
-                && self.remove_one(hash, true)
+            let classification =
+                if let Some(classification) = sweep.classifications.get(&walk.current).copied() {
+                    Some(classification)
+                } else {
+                    self.advance_finality_walk(&mut walk, sweep.checkpoint)
+                };
+
+            let Some(classification) = classification else {
+                sweep.active = Some(walk);
+                continue;
+            };
+
+            if classification != FinalityClassification::Unknown {
+                sweep.classifications.insert(walk.current, classification);
+                for hash in &walk.path {
+                    sweep.classifications.insert(*hash, classification);
+                }
+            }
+            if classification == FinalityClassification::Conflict
+                && self.current_incarnation(walk.root) == Some(walk.incarnation)
+                && self.remove_one(walk.root, true)
             {
-                retired.push(hash);
+                retired.push(walk.root);
             }
         }
-        if self
-            .finality_sweep
-            .as_ref()
-            .is_some_and(|sweep| sweep.pending.is_empty())
-        {
-            self.finality_sweep = None;
+        if !sweep.pending.is_empty() || sweep.active.is_some() {
+            self.finality_sweep = Some(sweep);
         }
         self.publish_retired(generation, &retired, RetirementReason::FinalizedConflict)?;
         self.update_candidate_metric();
         Ok(work)
     }
 
-    fn conflicts_with_finalized(&self, hash: B256, finalized: CheckpointMeta) -> bool {
-        let mut current_hash = hash;
-        for _ in 0..self.metadata_limit {
-            let Some(block) = self.block_meta(current_hash) else {
-                return false;
-            };
-            if block.number == finalized.number {
-                return block.hash != finalized.hash;
-            }
-            if block.number < finalized.number {
-                return false;
-            }
-            let Some(expected_parent_number) = block.number.checked_sub(1) else {
-                return false;
-            };
-            let Some(parent) = self.block_meta(block.parent_hash) else {
-                // A consensus-terminal parent makes every descendant terminal as well. This also
-                // preserves classification when a bounded sweep removed the parent earlier in
-                // the same or a previous maintenance iteration.
-                return self.tombstones.contains(&block.parent_hash);
-            };
-            if parent.number != expected_parent_number {
-                return false;
-            }
-            current_hash = parent.hash;
+    fn advance_finality_walk(
+        &self,
+        walk: &mut FinalityWalk,
+        finalized: CheckpointMeta,
+    ) -> Option<FinalityClassification> {
+        let Some(block) = self.block_meta(walk.current) else {
+            return Some(FinalityClassification::Unknown);
+        };
+        if block.number == finalized.number {
+            return Some(if block.hash == finalized.hash {
+                FinalityClassification::Compatible
+            } else {
+                FinalityClassification::Conflict
+            });
         }
-        false
+        if block.number < finalized.number {
+            return Some(FinalityClassification::Compatible);
+        }
+        let Some(expected_parent_number) = block.number.checked_sub(1) else {
+            return Some(FinalityClassification::Unknown);
+        };
+        let Some(parent) = self.block_meta(block.parent_hash) else {
+            // A consensus-terminal parent makes every descendant terminal as well. This preserves
+            // classification when an earlier bounded step already removed the parent.
+            return Some(if self.tombstones.contains(&block.parent_hash) {
+                FinalityClassification::Conflict
+            } else {
+                FinalityClassification::Unknown
+            });
+        };
+        if parent.number != expected_parent_number {
+            return Some(FinalityClassification::Unknown);
+        }
+        walk.path.push(walk.current);
+        walk.current = parent.hash;
+        None
     }
 
     fn block_meta(&self, hash: B256) -> Option<BlockMeta> {
@@ -2756,6 +2872,14 @@ mod tests {
         }
     }
 
+    fn applied_forkchoice(view: ForkchoiceMeta) -> AppliedForkchoiceMeta {
+        AppliedForkchoiceMeta {
+            head_hash: view.head.hash,
+            safe: view.safe,
+            finalized: view.finalized,
+        }
+    }
+
     fn decode_published(receiver: &mut broadcast::Receiver<PublishedFrame>) -> Envelope {
         let frame = receiver.try_recv().expect("expected published frame");
         Envelope::decode(&frame.bytes[4..]).expect("valid published envelope")
@@ -2892,12 +3016,12 @@ mod tests {
 
         assert!(
             publisher
-                .forkchoice_applied(1, Instant::now(), view)
+                .forkchoice_applied(1, Instant::now(), applied_forkchoice(view))
                 .unwrap()
         );
         assert!(
             publisher
-                .forkchoice_applied(1, Instant::now(), view)
+                .forkchoice_applied(1, Instant::now(), applied_forkchoice(view))
                 .unwrap()
         );
 
@@ -2928,7 +3052,7 @@ mod tests {
         let _candidate = decode_published(&mut frame_rx);
 
         publisher
-            .canonical(1, Instant::now(), next.number, next.hash)
+            .canonical(1, Instant::now(), Some(next.number), next.hash)
             .unwrap();
         let canonical = decode_published(&mut frame_rx);
         assert!(matches!(
@@ -2945,7 +3069,7 @@ mod tests {
         assert!(error.to_string().contains("forkchoice transition"));
 
         publisher
-            .forkchoice_applied(1, Instant::now(), forkchoice_for(next))
+            .forkchoice_applied(1, Instant::now(), applied_forkchoice(forkchoice_for(next)))
             .unwrap();
         let forkchoice = decode_published(&mut frame_rx);
         assert!(matches!(
@@ -2953,6 +3077,83 @@ mod tests {
             Some(envelope::Event::ForkchoiceApplied(_))
         ));
         assert_eq!(forkchoice.sequence, canonical.sequence + 1);
+    }
+
+    #[test]
+    fn applied_forkchoice_atomically_drives_canonical_transition_then_fence() {
+        let (mut publisher, shared, mut frame_rx, initial) = publisher_fixture();
+        let next = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, next, &[]).unwrap();
+        let _candidate = decode_published(&mut frame_rx);
+
+        publisher
+            .forkchoice_applied(1, Instant::now(), applied_forkchoice(forkchoice_for(next)))
+            .unwrap();
+
+        let canonical = decode_published(&mut frame_rx);
+        let Some(envelope::Event::CanonicalHead(canonical_head)) = canonical.event else {
+            panic!("expected canonical head before applied forkchoice fence")
+        };
+        assert_eq!(
+            canonical_head.previous_block_hash,
+            initial.block.hash.to_vec()
+        );
+        assert_eq!(canonical_head.block.unwrap().hash, next.hash.to_vec());
+
+        let fence = decode_published(&mut frame_rx);
+        assert!(matches!(
+            fence.event,
+            Some(envelope::Event::ForkchoiceApplied(_))
+        ));
+        assert_eq!(fence.sequence, canonical.sequence + 1);
+        assert_eq!(
+            shared.published.load().forkchoice,
+            Some(forkchoice_for(next))
+        );
+    }
+
+    #[test]
+    fn reconstructed_head_does_not_retire_the_published_canonical_before_transition() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        publisher.cache_limit = 2;
+        let side = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, side, &[]).unwrap();
+        let _side_candidate = decode_published(&mut frame_rx);
+
+        // This same-height head is absent from the candidate cache, so canonical() reconstructs it
+        // through SnapshotSource while the projection cache is already full (H + side).
+        let next_hash = B256::repeat_byte(10);
+        publisher
+            .canonical(1, Instant::now(), Some(initial.block.number), next_hash)
+            .unwrap();
+
+        let retirement = decode_published(&mut frame_rx);
+        let Some(envelope::Event::CandidatesRetired(retirement)) = retirement.event else {
+            panic!("expected unrelated side-candidate eviction before canonical transition")
+        };
+        assert_eq!(retirement.block_hashes, vec![side.hash.to_vec()]);
+        assert!(
+            publisher.candidates[&initial.block.hash]
+                .projection
+                .is_some()
+        );
+
+        let canonical = decode_published(&mut frame_rx);
+        let Some(envelope::Event::CanonicalHead(canonical)) = canonical.event else {
+            panic!("expected canonical transition after cache enforcement")
+        };
+        assert_eq!(canonical.previous_block_hash, initial.block.hash.to_vec());
+        assert_eq!(canonical.block.unwrap().hash, next_hash.to_vec());
     }
 
     #[test]
@@ -2981,7 +3182,7 @@ mod tests {
             let _ = decode_published(&mut frame_rx);
         }
         publisher
-            .canonical(1, Instant::now(), selected.number, selected.hash)
+            .canonical(1, Instant::now(), Some(selected.number), selected.hash)
             .unwrap();
         let _canonical = decode_published(&mut frame_rx);
         let view = ForkchoiceMeta {
@@ -3000,7 +3201,7 @@ mod tests {
         };
 
         publisher
-            .forkchoice_applied(1, Instant::now(), view)
+            .forkchoice_applied(1, Instant::now(), applied_forkchoice(view))
             .unwrap();
 
         let fence = decode_published(&mut frame_rx);
@@ -3024,6 +3225,70 @@ mod tests {
         assert!(publisher.candidates.contains_key(&selected.hash));
         assert!(!publisher.candidates.contains_key(&sibling.hash));
         assert!(!publisher.candidates.contains_key(&sibling_child.hash));
+    }
+
+    #[test]
+    fn absent_finalized_checkpoint_does_not_erase_known_finality() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        let selected = BlockMeta {
+            number: 11,
+            hash: B256::with_last_byte(11),
+            parent_hash: initial.block.hash,
+            timestamp: 11,
+        };
+        publisher.validated(1, selected, &[]).unwrap();
+        let _candidate = decode_published(&mut frame_rx);
+        publisher
+            .canonical(1, Instant::now(), Some(selected.number), selected.hash)
+            .unwrap();
+        let _canonical = decode_published(&mut frame_rx);
+
+        let finalized = CheckpointMeta {
+            number: selected.number,
+            hash: selected.hash,
+        };
+        publisher
+            .forkchoice_applied(
+                1,
+                Instant::now(),
+                applied_forkchoice(ForkchoiceMeta {
+                    head: finalized,
+                    safe: Some(finalized),
+                    finalized: Some(finalized),
+                }),
+            )
+            .unwrap();
+        let _finalized_fence = decode_published(&mut frame_rx);
+        assert_eq!(publisher.last_finalized, Some(finalized));
+
+        // An absent coherent checkpoint is not evidence that established finality was reverted.
+        publisher
+            .forkchoice_applied(
+                1,
+                Instant::now(),
+                applied_forkchoice(forkchoice_for(selected)),
+            )
+            .unwrap();
+        let _zero_checkpoint_fence = decode_published(&mut frame_rx);
+        assert_eq!(publisher.last_finalized, Some(finalized));
+
+        let conflicting = BlockMeta {
+            hash: B256::repeat_byte(11),
+            ..selected
+        };
+        publisher.validated(1, conflicting, &[]).unwrap();
+        let _conflicting_candidate = decode_published(&mut frame_rx);
+        publisher.maintain().unwrap();
+
+        let retirement = decode_published(&mut frame_rx);
+        let Some(envelope::Event::CandidatesRetired(retirement)) = retirement.event else {
+            panic!("expected finality retirement after absent-checkpoint FCU")
+        };
+        assert_eq!(
+            RetirementReason::try_from(retirement.reason),
+            Ok(RetirementReason::FinalizedConflict)
+        );
+        assert_eq!(retirement.block_hashes, vec![conflicting.hash.to_vec()]);
     }
 
     #[test]
@@ -3055,6 +3320,48 @@ mod tests {
             publisher.finality_sweep.as_ref().unwrap().pending.len(),
             before - 1
         );
+    }
+
+    #[test]
+    fn finality_budget_counts_ancestry_edges_instead_of_whole_candidates() {
+        let (mut publisher, _shared, mut frame_rx, initial) = publisher_fixture();
+        let mut parent = initial.block;
+        for number in 11..=14 {
+            let block = BlockMeta {
+                number,
+                hash: B256::with_last_byte(number as u8),
+                parent_hash: parent.hash,
+                timestamp: number,
+            };
+            publisher.validated(1, block, &[]).unwrap();
+            let _ = decode_published(&mut frame_rx);
+            parent = block;
+        }
+        let incarnation = publisher.current_incarnation(parent.hash).unwrap();
+        publisher.finality_sweep = Some(FinalitySweep {
+            checkpoint: CheckpointMeta {
+                number: initial.block.number,
+                hash: initial.block.hash,
+            },
+            pending: VecDeque::from([(incarnation, parent.hash)]),
+            classifications: HashMap::default(),
+            active: None,
+        });
+
+        assert_eq!(publisher.process_finality_budget(1, 1).unwrap(), 1);
+        let active = publisher
+            .finality_sweep
+            .as_ref()
+            .and_then(|sweep| sweep.active.as_ref())
+            .expect("deep ancestry walk remains incremental");
+        assert_eq!(active.current, B256::with_last_byte(13));
+        assert!(publisher.candidates.contains_key(&parent.hash));
+
+        assert_eq!(publisher.process_finality_budget(1, 3).unwrap(), 3);
+        assert!(publisher.finality_sweep.is_some());
+        assert_eq!(publisher.process_finality_budget(1, 1).unwrap(), 1);
+        assert!(publisher.finality_sweep.is_none());
+        assert!(publisher.candidates.contains_key(&parent.hash));
     }
 
     #[test]
@@ -3161,6 +3468,28 @@ mod tests {
         assert!(matches!(first.event, Some(envelope::Event::Gap(_))));
         assert!(matches!(second.event, Some(envelope::Event::Snapshot(_))));
         assert!(frame_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn canonical_state_reset_publishes_gap_then_anchored_snapshot() {
+        let (mut publisher, shared, mut frame_rx, initial) = publisher_fixture();
+        publisher
+            .handle(FeedEvent::CanonicalStateReset {
+                observed_at: Instant::now(),
+                generation: 1,
+                head: CheckpointMeta {
+                    number: initial.block.number,
+                    hash: initial.block.hash,
+                },
+            })
+            .unwrap();
+
+        let gap = decode_published(&mut frame_rx);
+        assert!(matches!(gap.event, Some(envelope::Event::Gap(_))));
+        let snapshot = decode_published(&mut frame_rx);
+        assert!(matches!(snapshot.event, Some(envelope::Event::Snapshot(_))));
+        assert_eq!(snapshot.sequence, gap.sequence + 1);
+        assert!(!shared.published.load().recovering);
     }
 
     #[tokio::test]
@@ -3296,7 +3625,7 @@ mod tests {
 
         let (first_ack, mut first_completion) = tokio::sync::oneshot::channel();
         publisher
-            .handle(FeedEvent::ActivateConfig {
+            .handle_control(ControlEvent::ActivateConfig {
                 watch_set: Arc::clone(&next_watch_set),
                 ack: first_ack,
             })
@@ -3306,7 +3635,7 @@ mod tests {
 
         let (second_ack, mut second_completion) = tokio::sync::oneshot::channel();
         publisher
-            .handle(FeedEvent::ActivateConfig {
+            .handle_control(ControlEvent::ActivateConfig {
                 watch_set: next_watch_set,
                 ack: second_ack,
             })
@@ -3702,14 +4031,14 @@ mod tests {
             .unwrap();
 
         publisher
-            .canonical(1, Instant::now(), 12, first_child)
+            .canonical(1, Instant::now(), Some(12), first_child)
             .unwrap();
         assert_eq!(
             value_at(&shared.published.load().canonical.values, 0),
             U256::from(3)
         );
         publisher
-            .canonical(1, Instant::now(), 12, sibling_child)
+            .canonical(1, Instant::now(), Some(12), sibling_child)
             .unwrap();
         assert_eq!(publisher.canonical_hash, sibling_child);
         assert_eq!(
@@ -3719,7 +4048,7 @@ mod tests {
 
         let sequence = shared.published_sequence.load(Ordering::Acquire);
         publisher
-            .canonical(1, Instant::now(), 12, sibling_child)
+            .canonical(1, Instant::now(), Some(12), sibling_child)
             .unwrap();
         assert_eq!(
             shared.published_sequence.load(Ordering::Acquire),
@@ -3728,7 +4057,7 @@ mod tests {
         );
 
         publisher
-            .canonical(1, Instant::now(), 10, initial.block.hash)
+            .canonical(1, Instant::now(), Some(10), initial.block.hash)
             .unwrap();
         assert_eq!(
             publisher.canonical_hash, initial.block.hash,
@@ -3925,14 +4254,16 @@ mod tests {
                 snapshot_anchored_at
                     .checked_sub(Duration::from_millis(1))
                     .unwrap(),
-                11,
+                Some(11),
                 B256::with_last_byte(11),
             )
             .unwrap();
         assert_eq!(publisher.canonical_hash, initial.block.hash);
 
         let reorg = B256::repeat_byte(11);
-        publisher.canonical(0, Instant::now(), 10, reorg).unwrap();
+        publisher
+            .canonical(0, Instant::now(), Some(10), reorg)
+            .unwrap();
         assert_eq!(
             publisher.canonical_hash, reorg,
             "a transition observed during reload must survive the generation switch"

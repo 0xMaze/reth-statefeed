@@ -11,7 +11,7 @@ use reth::revm::revm::{
 };
 use reth_statefeed::{
     config::WatchConfig,
-    feed::{BlockMeta, CheckpointMeta, FeedProducer, ForkchoiceMeta, extract_changes},
+    feed::{AppliedForkchoiceMeta, BlockMeta, FeedProducer, extract_changes},
     watch::WatchSet,
 };
 
@@ -157,11 +157,8 @@ fn extraction_enqueue_round_trip(c: &mut Criterion) {
 
 fn forkchoice_enqueue_round_trip(c: &mut Criterion) {
     let (producer, receiver) = FeedProducer::channel(watch_set(1), 16);
-    let view = ForkchoiceMeta {
-        head: CheckpointMeta {
-            number: 1,
-            hash: B256::with_last_byte(1),
-        },
+    let view = AppliedForkchoiceMeta {
+        head_hash: B256::with_last_byte(1),
         safe: None,
         finalized: None,
     };

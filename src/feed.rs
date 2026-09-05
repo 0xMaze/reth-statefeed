@@ -1,7 +1,7 @@
 //! Non-blocking producer used by Reth's validation thread.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
@@ -45,10 +45,40 @@ pub struct CheckpointMeta {
 pub struct ForkchoiceMeta {
     /// Selected canonical head.
     pub head: CheckpointMeta,
-    /// Selected safe checkpoint, absent when the Engine API supplied the zero hash.
+    /// Effective safe checkpoint coherent with `head`, if Reth has one.
     pub safe: Option<CheckpointMeta>,
-    /// Selected finalized checkpoint, absent when the Engine API supplied the zero hash.
+    /// Effective finalized checkpoint coherent with `head`, if Reth has one.
     pub finalized: Option<CheckpointMeta>,
+}
+
+/// Applied forkchoice data captured on the Engine API thread before head metadata is resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedForkchoiceMeta {
+    /// Head hash selected by the FCU. Its number is resolved on the publisher/snapshot path.
+    pub head_hash: B256,
+    /// Effective safe checkpoint retained by Reth, if one is coherent with the selected head.
+    pub safe: Option<CheckpointMeta>,
+    /// Effective finalized checkpoint retained by Reth.
+    pub finalized: Option<CheckpointMeta>,
+}
+
+impl AppliedForkchoiceMeta {
+    /// Resolves the selected head number and removes retained checkpoints above an ancestor head.
+    #[inline]
+    pub(crate) fn resolve(self, head_number: u64) -> ForkchoiceMeta {
+        // A valid FCU can select an ancestor while Reth retains a newer safe checkpoint
+        // internally. Such a checkpoint is not coherent with this downstream view.
+        let coherent =
+            |checkpoint: CheckpointMeta| (checkpoint.number <= head_number).then_some(checkpoint);
+        ForkchoiceMeta {
+            head: CheckpointMeta {
+                number: head_number,
+                hash: self.head_hash,
+            },
+            safe: self.safe.and_then(coherent),
+            finalized: self.finalized.and_then(coherent),
+        }
+    }
 }
 
 /// Compact events transferred from the engine thread to the publisher.
@@ -88,16 +118,14 @@ pub enum FeedEvent {
         /// Absolute watched post-state changes.
         changes: BlockChanges,
     },
-    /// Forkchoice selected a canonical head.
-    Canonical {
-        /// Time at which the forkchoice observer received the transition.
+    /// Internal sync/backfill changed canonical state without applying an Engine API FCU.
+    CanonicalStateReset {
+        /// Time at which the reset observer received the transition.
         observed_at: Instant,
-        /// Watch generation active when forkchoice produced this transition.
+        /// Watch generation active when the reset was observed.
         generation: Generation,
-        /// Canonical block number observed in the engine tree.
-        block_number: u64,
-        /// Selected head hash.
-        block_hash: B256,
+        /// New canonical head installed by the internal reset.
+        head: CheckpointMeta,
     },
     /// A `VALID` forkchoice update was accepted and fully applied by Reth.
     ForkchoiceApplied {
@@ -105,8 +133,8 @@ pub enum FeedEvent {
         observed_at: Instant,
         /// Watch generation active when forkchoice was applied.
         generation: Generation,
-        /// Resolved head/safe/finalized view.
-        view: ForkchoiceMeta,
+        /// Hash-only head plus already-resolved effective checkpoints.
+        view: AppliedForkchoiceMeta,
     },
     /// Validation rejected a block or payload.
     Rejected {
@@ -119,6 +147,11 @@ pub enum FeedEvent {
         /// Stable machine-readable category.
         reason: &'static str,
     },
+}
+
+/// Publisher control plane kept separate from latency-sensitive engine data.
+#[derive(Debug)]
+pub(crate) enum ControlEvent {
     /// Requests an atomic switch to a prevalidated watch set.
     ActivateConfig {
         /// New immutable dictionary. The publisher snapshots it before making it hot-path active.
@@ -139,6 +172,8 @@ pub(crate) enum ActivationRequest {
 struct ProducerInner {
     watch_set: ArcSwap<WatchSet>,
     tx: Sender<FeedEvent>,
+    control_tx: Sender<ControlEvent>,
+    control_rx: Mutex<Option<Receiver<ControlEvent>>>,
     /// High bit serializes enqueue attempts; low bits retain loss until publisher recovery.
     enqueue_state: AtomicU64,
     loss_tx: Sender<()>,
@@ -178,11 +213,14 @@ impl FeedProducer {
     /// Creates a producer and the single receiver consumed by the publisher.
     pub fn channel(watch_set: Arc<WatchSet>, capacity: usize) -> (Self, Receiver<FeedEvent>) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(1);
         let (loss_tx, loss_rx) = crossbeam_channel::bounded(1);
         let producer = Self {
             inner: Arc::new(ProducerInner {
                 watch_set: ArcSwap::new(watch_set),
                 tx,
+                control_tx,
+                control_rx: Mutex::new(Some(control_rx)),
                 enqueue_state: AtomicU64::new(0),
                 loss_tx,
                 loss_rx,
@@ -249,21 +287,20 @@ impl FeedProducer {
         });
     }
 
-    /// Queues a canonical-head transition without waiting.
-    pub fn publish_canonical(&self, block_number: u64, block_hash: B256) {
+    /// Requests a canonical re-anchor after an internal sync/backfill reset.
+    pub fn publish_canonical_state_reset(&self, head: CheckpointMeta) {
         let observed_at = Instant::now();
         let generation = self.inner.watch_set.load().generation();
-        self.try_send(FeedEvent::Canonical {
+        self.try_send(FeedEvent::CanonicalStateReset {
             observed_at,
             generation,
-            block_number,
-            block_hash,
+            head,
         });
     }
 
     /// Queues an applied forkchoice ordering fence without waiting.
     #[inline]
-    pub fn publish_forkchoice_applied(&self, view: ForkchoiceMeta) {
+    pub fn publish_forkchoice_applied(&self, view: AppliedForkchoiceMeta) {
         let observed_at = Instant::now();
         let generation = self.inner.watch_set.load().generation();
         self.try_send(FeedEvent::ForkchoiceApplied {
@@ -290,37 +327,18 @@ impl FeedProducer {
     /// The publisher loads and broadcasts an anchored snapshot first, then calls [`Self::activate`].
     /// This ordering prevents block events from referencing a dictionary consumers have not seen.
     pub(crate) fn request_activation(&self, watch_set: Arc<WatchSet>) -> ActivationRequest {
-        if self
-            .inner
-            .enqueue_state
-            .compare_exchange(0, ENQUEUE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return ActivationRequest::Full;
-        }
         let (ack, completion) = oneshot::channel();
-        let result = match self
+        match self
             .inner
-            .tx
-            .try_send(FeedEvent::ActivateConfig { watch_set, ack })
+            .control_tx
+            .try_send(ControlEvent::ActivateConfig { watch_set, ack })
         {
-            Ok(()) => {
-                self.inner.metrics.queued_events.increment(1);
-                ActivationRequest::Queued(completion)
-            }
+            Ok(()) => ActivationRequest::Queued(completion),
             // Losing a reload request does not break state continuity for the active generation.
             // Treating it as a data gap would force an unnecessary provider snapshot.
             Err(TrySendError::Full(_)) => ActivationRequest::Full,
             Err(TrySendError::Disconnected(_)) => ActivationRequest::Disconnected,
-        };
-        let previous = self
-            .inner
-            .enqueue_state
-            .fetch_and(DROP_COUNT_MASK, Ordering::Release);
-        if previous & DROP_COUNT_MASK != 0 {
-            self.notify_loss();
         }
-        result
     }
 
     /// Number of hot-path events dropped by overflow or while a gap marker was pending.
@@ -360,6 +378,16 @@ impl FeedProducer {
     /// Wake-up channel used when overflow happens after the publisher drained the data queue.
     pub(crate) fn loss_notifications(&self) -> Receiver<()> {
         self.inner.loss_rx.clone()
+    }
+
+    /// Single-consumer control channel for configuration transactions.
+    pub(crate) fn take_control_events(&self) -> Receiver<ControlEvent> {
+        self.inner
+            .control_rx
+            .lock()
+            .expect("statefeed control receiver mutex poisoned")
+            .take()
+            .expect("statefeed control receiver can only have one publisher")
     }
 
     #[inline]
@@ -523,6 +551,13 @@ mod tests {
     use super::*;
     use crate::config::WatchConfig;
 
+    fn publish_test_event(producer: &FeedProducer, number: u64) {
+        producer.publish_canonical_state_reset(CheckpointMeta {
+            number,
+            hash: B256::with_last_byte(number as u8),
+        });
+    }
+
     #[test]
     fn extracts_only_changed_watched_slots() {
         let address = Address::with_last_byte(1);
@@ -641,27 +676,27 @@ mod tests {
         ));
         let (producer, receiver) = FeedProducer::channel(watch_set, 2);
 
-        producer.publish_canonical(1, B256::with_last_byte(1));
-        producer.publish_canonical(2, B256::with_last_byte(2));
-        producer.publish_canonical(3, B256::with_last_byte(3));
+        publish_test_event(&producer, 1);
+        publish_test_event(&producer, 2);
+        publish_test_event(&producer, 3);
         assert_eq!(producer.dropped_events(), 1);
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
         assert_eq!(producer.take_pending_loss(), 1);
-        producer.publish_canonical(4, B256::with_last_byte(4));
+        publish_test_event(&producer, 4);
         assert_eq!(producer.dropped_events(), 1);
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
         assert_eq!(producer.take_pending_loss(), 0);
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
     }
 
@@ -677,18 +712,18 @@ mod tests {
         ));
         let (producer, receiver) = FeedProducer::channel(watch_set, 1);
 
-        producer.publish_canonical(1, B256::with_last_byte(1));
-        producer.publish_canonical(2, B256::with_last_byte(2));
+        publish_test_event(&producer, 1);
+        publish_test_event(&producer, 2);
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
 
         std::thread::scope(|scope| {
             for number in 3..11 {
                 let producer = producer.clone();
                 scope.spawn(move || {
-                    producer.publish_canonical(number, B256::with_last_byte(number as u8));
+                    publish_test_event(&producer, number);
                 });
             }
         });
@@ -709,15 +744,15 @@ mod tests {
         ));
         let (producer, receiver) = FeedProducer::channel(watch_set, 1);
 
-        producer.publish_canonical(1, B256::with_last_byte(1));
-        producer.publish_canonical(2, B256::with_last_byte(2));
+        publish_test_event(&producer, 1);
+        publish_test_event(&producer, 2);
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
 
         // Capacity is available again, but the stream must recover before accepting later data.
-        producer.publish_canonical(3, B256::with_last_byte(3));
+        publish_test_event(&producer, 3);
         assert!(receiver.try_recv().is_err());
         assert_eq!(producer.take_pending_loss(), 2);
     }
@@ -734,24 +769,24 @@ mod tests {
         ));
         let (producer, receiver) = FeedProducer::channel(watch_set, 2);
 
-        producer.publish_canonical(1, B256::with_last_byte(1));
-        producer.publish_canonical(2, B256::with_last_byte(2));
-        producer.publish_canonical(3, B256::with_last_byte(3));
+        publish_test_event(&producer, 1);
+        publish_test_event(&producer, 2);
+        publish_test_event(&producer, 3);
         assert_eq!(producer.dropped_events(), 1);
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
         assert_eq!(producer.take_pending_loss(), 1);
         assert!(matches!(
             receiver.recv().unwrap(),
-            FeedEvent::Canonical { .. }
+            FeedEvent::CanonicalStateReset { .. }
         ));
     }
 
     #[test]
-    fn rejected_reload_request_does_not_create_a_data_gap() {
+    fn reload_control_contention_does_not_create_a_data_gap() {
         let watch_set = Arc::new(WatchSet::compile(
             1,
             &[WatchConfig {
@@ -760,9 +795,8 @@ mod tests {
                 slot: B256::ZERO,
             }],
         ));
-        let (producer, _receiver) = FeedProducer::channel(Arc::clone(&watch_set), 2);
-        producer.publish_canonical(1, B256::with_last_byte(1));
-        producer.publish_canonical(2, B256::with_last_byte(2));
+        let (producer, _receiver) = FeedProducer::channel(Arc::clone(&watch_set), 1);
+        publish_test_event(&producer, 1);
 
         let next = Arc::new(WatchSet::compile(
             2,
@@ -772,9 +806,31 @@ mod tests {
                 slot: B256::with_last_byte(1),
             }],
         ));
+        let first = producer.request_activation(Arc::clone(&next));
+        assert!(matches!(first, ActivationRequest::Queued(_)));
         assert!(matches!(
             producer.request_activation(next),
             ActivationRequest::Full
+        ));
+        assert_eq!(producer.dropped_events(), 0);
+    }
+
+    #[test]
+    fn reload_reports_disconnection_after_publisher_exits() {
+        let watch_set = Arc::new(WatchSet::compile(
+            1,
+            &[WatchConfig {
+                id: "value".into(),
+                address: Address::ZERO,
+                slot: B256::ZERO,
+            }],
+        ));
+        let (producer, _receiver) = FeedProducer::channel(Arc::clone(&watch_set), 1);
+        drop(producer.take_control_events());
+
+        assert!(matches!(
+            producer.request_activation(watch_set),
+            ActivationRequest::Disconnected
         ));
         assert_eq!(producer.dropped_events(), 0);
     }
@@ -824,11 +880,8 @@ mod tests {
             }],
         ));
         let (producer, receiver) = FeedProducer::channel(watch_set, 1);
-        let view = ForkchoiceMeta {
-            head: CheckpointMeta {
-                number: 42,
-                hash: B256::with_last_byte(42),
-            },
+        let view = AppliedForkchoiceMeta {
+            head_hash: B256::with_last_byte(42),
             safe: Some(CheckpointMeta {
                 number: 41,
                 hash: B256::with_last_byte(41),

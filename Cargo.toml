@@ -20,14 +20,14 @@ humantime-serde = "1"
 metrics = "0.24"
 notify = "8"
 prost = "0.14"
-reth = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316", default-features = false }
-reth-chain-state = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
-reth-cli-util = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
-reth-db = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316", features = ["mdbx"] }
-reth-engine-tree = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
-reth-node-api = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
-reth-node-ethereum = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
-reth-storage-overlay = { git = "https://github.com/0xMaze/reth", rev = "3de74507098383427f8459940a4fe106e4139316" }
+reth = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804", default-features = false }
+reth-chain-state = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
+reth-cli-util = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
+reth-db = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804", features = ["mdbx"] }
+reth-engine-tree = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
+reth-node-api = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
+reth-node-ethereum = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
+reth-storage-overlay = { git = "https://github.com/0xMaze/reth", rev = "6ae6a150e488442a697035e33c5266d2f69ca804" }
 serde = { version = "1", features = ["derive"] }
 smallvec = "1.15"
 thiserror = "2"

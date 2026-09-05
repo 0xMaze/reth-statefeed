@@ -23,7 +23,9 @@ use reth_statefeed::{
     config::Config,
     feed::FeedProducer,
     publisher::{ServiceOptions, start_service},
-    reth_integration::{RethSnapshotSource, StatefeedEngineValidatorBuilder},
+    reth_integration::{
+        AppliedForkchoiceTracker, RethSnapshotSource, StatefeedEngineValidatorBuilder,
+    },
     watch::WatchSet,
 };
 use tracing::info;
@@ -78,12 +80,16 @@ async fn run_node(
     let watch_set = Arc::new(WatchSet::compile(1, &config.watch));
     let (producer, receiver) =
         FeedProducer::channel(Arc::clone(&watch_set), config.stream.queue_capacity);
+    let forkchoice_tracker = AppliedForkchoiceTracker::default();
 
     let chain_spec = Arc::clone(&builder.config().chain);
     let chain_id = chain_spec.chain().id();
     let genesis_hash = chain_spec.genesis_hash();
-    let validator_builder =
-        StatefeedEngineValidatorBuilder::new(producer.clone(), config.stream.publish_executed);
+    let validator_builder = StatefeedEngineValidatorBuilder::new(
+        producer.clone(),
+        forkchoice_tracker.clone(),
+        config.stream.publish_executed,
+    );
     let add_ons = EthereumAddOns::new(RpcAddOns::new(
         EthereumEthApiBuilder::<alloy_network::Ethereum>::default(),
         EthereumEngineValidatorBuilder::default(),
@@ -106,7 +112,10 @@ async fn run_node(
         .launch_with_debug_capabilities()
         .await?;
 
-    let snapshot_source = Arc::new(RethSnapshotSource::new(handle.node.provider.clone()));
+    let snapshot_source = Arc::new(RethSnapshotSource::new(
+        handle.node.provider.clone(),
+        forkchoice_tracker,
+    ));
     let service = start_service(
         ServiceOptions {
             config_path,

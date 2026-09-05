@@ -5,7 +5,7 @@ of selected physical storage slots to local consumers. It is protocol-agnostic: 
 already-derived 32-byte storage keys live in TOML, while PSM/GSM formulas and routing decisions
 remain downstream.
 
-The node uses the isolated fork commit `3de74507098383427f8459940a4fe106e4139316`, a three-commit
+The node uses the isolated fork commit `6ae6a150e488442a697035e33c5266d2f69ca804`, a five-commit
 patch series on top of the exact upstream Reth `v2.5.2` commit
 `5a6940e351fed80458fe6c9da8581cbe4b8bd036`.
 It uses the stock Reth datadir and CLI; no slots are compiled into the binary.
@@ -21,7 +21,7 @@ The implemented path publishes:
   not pass through it;
 - a full self-contained projection on every `CANONICAL` transition;
 - a `ForkchoiceApplied` ordering fence for every applied `VALID` FCU, including same-head
-  reaffirmations, with resolved head/safe/finalized checkpoints;
+  reaffirmations, with a coherent head and effective safe/finalized checkpoints;
 - exact `CandidatesRetired` batches for local projection eviction, TTL expiry, and finalized-fork
   conflicts;
 - a machine-readable `REJECTED` notification for invalid blocks/payloads;
@@ -32,8 +32,8 @@ Set `stream.publish_executed = true` at startup to advertise `CAP_EXECUTED` and 
 pre-state-root stream. Protocol v2 always advertises `CAP_FORKCHOICE_APPLIED` and
 `CAP_CANDIDATE_RETIREMENT`, so consumers can cancel work on non-selected candidates without
 mistaking a temporary choice for permanent invalidity. It defaults to `false` for a controlled
-rollout. The Reth fork contains only generic execution, canonical-head, and applied-forkchoice
-hooks; it has no knowledge of slots, statefeed, protobuf, or transport.
+rollout. The Reth fork contains only generic execution and engine-lifecycle observer hooks; it has
+no knowledge of slots, statefeed, protobuf, or transport.
 
 ## Latency design
 
@@ -49,13 +49,19 @@ only its compact watched delta and does no provider I/O on the early path. A rar
 provider fallback happens only after validation, producing a complete `VALIDATED` projection
 without racing the child's insertion into the engine tree.
 
+Applied forkchoice is copied into a lock-free revisioned tracker before entering the bounded event
+queue. Startup/recovery snapshots use that revision to detect concurrent FCU changes, and queue
+loss therefore converges directly to the latest applied view. Internal backfill resets explicitly
+invalidate this anchor and produce `Gap` followed by a new snapshot.
+
 The publisher runs on its own OS thread. It can be pinned to a reserved logical CPU and optionally
 busy-spin for a short interval before parking. Watched lookups scan the smaller of the account's
 storage diff and its configured slots. Candidate projections are kept as one packed buffer and
 protobuf serialization is done once per event; all consumers share that encoded frame. Candidate
 ancestry uses a parent-to-children index, so subtree rejection is proportional to the removed
-branch rather than the whole cache. Reaffirmed FCUs perform fixed-size work; finality scans run only
-when the finalized checkpoint changes.
+branch rather than the whole cache. Reaffirmed FCUs perform fixed-size work. Finality scans run only
+when the finalized checkpoint changes; their maintenance budget counts individual ancestry edges,
+and path compression prevents repeated traversal of shared branches.
 
 ## Build
 
